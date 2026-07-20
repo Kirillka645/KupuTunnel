@@ -31,20 +31,20 @@ data class ProfileSettings(
                 NetworkProfileMode.MOBILE -> ProfileSettings(
                     mode = effective,
                     label = "LTE / мобильный",
-                    batchSize = 16,
-                    connectTimeoutMs = 900,
-                    maxPingMs = 4000,
-                    maxToCheck = 120,
-                    stopWhenFound = 20
+                    batchSize = 12,
+                    connectTimeoutMs = 800,
+                    maxPingMs = 3500,
+                    maxToCheck = 80,
+                    stopWhenFound = 15
                 )
                 else -> ProfileSettings(
                     mode = NetworkProfileMode.WIFI,
                     label = "Wi‑Fi",
-                    batchSize = 24,
-                    connectTimeoutMs = 1000,
-                    maxPingMs = 5000,
-                    maxToCheck = 180,
-                    stopWhenFound = 30
+                    batchSize = 16,
+                    connectTimeoutMs = 900,
+                    maxPingMs = 4000,
+                    maxToCheck = 100,
+                    stopWhenFound = 20
                 )
             }
         }

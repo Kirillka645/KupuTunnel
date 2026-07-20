@@ -16,7 +16,7 @@ import okhttp3.Request
 
 object ConfigManager {
 
-    private const val MAX_CONFIGS = 20_000
+    private const val MAX_CONFIGS = 3_000
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)

@@ -299,10 +299,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openList(list: List<ConfigWithPing>, title: String) {
+        // Не пихаем сотни URL в Intent — краш TransactionTooLarge
+        ScanResultStore.save(this, list, title, autoConnect = false)
         startActivity(
             Intent(this, ConfigListActivity::class.java).apply {
                 putExtra(EXTRA_SOURCE_NAME, title)
-                putExtra(EXTRA_CONFIGS, ArrayList(list))
+                putExtra(EXTRA_LOAD_FROM_STORE, true)
             }
         )
     }
@@ -407,6 +409,7 @@ class MainActivity : AppCompatActivity() {
         const val EXTRA_CONFIGS = "configs"
         const val EXTRA_OFFLINE_LIST = "offline_list"
         const val EXTRA_AUTO_CONNECT = "auto_connect"
+        const val EXTRA_LOAD_FROM_STORE = "load_from_store"
 
         const val MODE_MEGA = "mega"
         const val MODE_SOURCE = "source"

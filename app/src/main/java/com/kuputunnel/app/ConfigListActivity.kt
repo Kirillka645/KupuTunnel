@@ -2,7 +2,6 @@ package com.kuputunnel.app
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.widget.TextView
 import android.widget.Toast
@@ -27,11 +26,13 @@ class ConfigListActivity : AppCompatActivity() {
     private var filteredList: List<ConfigWithPing> = emptyList()
     private var sourceName: String = ""
     private var maxPingFilter = Int.MAX_VALUE
+    private var autoConnectDone = false
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         ConfigLauncher.onVpnPermissionResult(this, result.resultCode == RESULT_OK)
+        refreshFab()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,17 +44,23 @@ class ConfigListActivity : AppCompatActivity() {
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         toolbar.setNavigationOnClickListener { finish() }
 
-        sourceName = intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME) ?: "Узлы"
+        // Всегда грузим с диска/памяти — безопасно
+        sourceName = intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME)
+            ?: ScanResultStore.title
         supportActionBar?.title = sourceName
 
-        @Suppress("UNCHECKED_CAST")
-        configsList = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getSerializableExtra(MainActivity.EXTRA_CONFIGS, ArrayList::class.java)
-                as? List<ConfigWithPing> ?: emptyList()
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getSerializableExtra(MainActivity.EXTRA_CONFIGS) as? ArrayList<ConfigWithPing>
-                ?: emptyList()
+        configsList = try {
+            ScanResultStore.load(this)
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        // fallback: кэш Wi‑Fi/LTE
+        if (configsList.isEmpty()) {
+            configsList = ConfigCache.loadWorking(this, NetworkProfileMode.WIFI)
+            if (configsList.isEmpty()) {
+                configsList = ConfigCache.loadWorking(this, NetworkProfileMode.MOBILE)
+            }
         }
 
         filteredList = configsList
@@ -62,6 +69,7 @@ class ConfigListActivity : AppCompatActivity() {
 
         recyclerView = findViewById(R.id.recyclerView)
         recyclerView.layoutManager = LinearLayoutManager(this)
+        recyclerView.setHasFixedSize(true)
         recyclerView.adapter = ConfigAdapter(this, filteredList)
 
         fabBest = findViewById(R.id.fabBest)
@@ -71,14 +79,21 @@ class ConfigListActivity : AppCompatActivity() {
             } else {
                 connectBest()
             }
+            refreshFab()
         }
         refreshFab()
-
         setupToolbarMenu()
 
-        // Авто-подключение лучшего после «Лучший VPN»
-        if (intent.getBooleanExtra(MainActivity.EXTRA_AUTO_CONNECT, false) && configsList.isNotEmpty()) {
-            connectBest()
+        // Авто-connect только один раз
+        val wantAuto = ScanResultStore.consumeAutoConnect() ||
+            intent.getBooleanExtra(MainActivity.EXTRA_AUTO_CONNECT, false)
+        if (wantAuto && configsList.isNotEmpty() && !autoConnectDone) {
+            autoConnectDone = true
+            recyclerView.post { connectBest() }
+        }
+
+        if (configsList.isEmpty()) {
+            Toast.makeText(this, "Список пуст — запусти скан", Toast.LENGTH_SHORT).show()
         }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -99,31 +114,6 @@ class ConfigListActivity : AppCompatActivity() {
         }
     }
 
-    private fun setupToolbarMenu() {
-        toolbar.inflateMenu(R.menu.config_list_menu)
-        toolbar.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                R.id.action_about -> {
-                    showAboutDialog()
-                    true
-                }
-                R.id.action_copy_all -> {
-                    copyAll()
-                    true
-                }
-                R.id.action_filter -> {
-                    showFilterDialog()
-                    true
-                }
-                R.id.action_share -> {
-                    shareList()
-                    true
-                }
-                else -> false
-            }
-        }
-    }
-
     override fun onResume() {
         super.onResume()
         refreshFab()
@@ -139,11 +129,7 @@ class ConfigListActivity : AppCompatActivity() {
     }
 
     private fun refreshFab() {
-        if (VpnSession.isConnected()) {
-            fabBest.text = "Отключить VPN"
-        } else {
-            fabBest.text = "⚡ Подключить лучший"
-        }
+        fabBest.text = if (VpnSession.isConnected()) "Отключить VPN" else "⚡ Подключить лучший"
     }
 
     private fun connectBest() {
@@ -153,8 +139,11 @@ class ConfigListActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.no_configs, Toast.LENGTH_SHORT).show()
             return
         }
-        Toast.makeText(this, "VPN → ${best.host}:${best.port} · ${best.pingMs} ms", Toast.LENGTH_SHORT)
-            .show()
+        Toast.makeText(
+            this,
+            "VPN → ${best.host}:${best.port} · ${best.pingMs} ms",
+            Toast.LENGTH_SHORT
+        ).show()
         val prep = android.net.VpnService.prepare(this)
         if (prep != null) {
             VpnSession.pendingConfig = best.url
@@ -162,76 +151,76 @@ class ConfigListActivity : AppCompatActivity() {
         } else {
             ConfigLauncher.launch(this, best.url)
         }
+        refreshFab()
     }
 
-    private fun showFilterDialog() {
-        val options = arrayOf("Все", "≤ 100 ms", "≤ 200 ms", "≤ 300 ms", "≤ 500 ms")
-        val values = intArrayOf(Int.MAX_VALUE, 100, 200, 300, 500)
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Фильтр по пингу")
-            .setItems(options) { _, which ->
-                maxPingFilter = values[which]
-                filteredList = if (maxPingFilter == Int.MAX_VALUE) {
-                    configsList
-                } else {
-                    configsList.filter { it.pingMs in 1..maxPingFilter }
+    private fun setupToolbarMenu() {
+        toolbar.inflateMenu(R.menu.config_list_menu)
+        toolbar.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_about -> {
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("KupuTunnel v${BuildConfig.VERSION_NAME}")
+                        .setMessage("Системный VPN · Xray\nVLESS Reality / VMess / Trojan / SS / Socks")
+                        .setPositiveButton("GitHub") { _, _ ->
+                            try {
+                                startActivity(
+                                    Intent(
+                                        Intent.ACTION_VIEW,
+                                        Uri.parse("https://github.com/${BuildConfig.GITHUB_REPO}")
+                                    )
+                                )
+                            } catch (_: Exception) {
+                            }
+                        }
+                        .setNegativeButton("OK", null)
+                        .show()
+                    true
                 }
-                recyclerView.adapter = ConfigAdapter(this, filteredList)
-                updateSubtitle()
-            }
-            .show()
-    }
-
-    private fun shareList() {
-        val text = formatWithFooter(filteredList.take(50))
-        startActivity(
-            Intent.createChooser(
-                Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_TEXT, text)
-                },
-                "Поделиться конфигами"
-            )
-        )
-    }
-
-    private fun copyAll() {
-        if (filteredList.isEmpty()) {
-            Toast.makeText(this, R.string.no_configs, Toast.LENGTH_SHORT).show()
-            return
-        }
-        ConfigLauncher.copy(this, formatWithFooter(filteredList))
-        Toast.makeText(this, "Скопировано ${filteredList.size}", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun formatWithFooter(configs: List<ConfigWithPing>): String {
-        val body = configs.mapIndexed { i, c ->
-            if (c.pingMs > 0) "${i + 1}. ${c.url}  (${c.pingMs}ms)"
-            else "${i + 1}. ${c.url}"
-        }.joinToString("\n")
-        return "$body\n\nKupuTunnel — https://github.com/${BuildConfig.GITHUB_REPO}"
-    }
-
-    private fun showAboutDialog() {
-        MaterialAlertDialogBuilder(this)
-            .setTitle("KupuTunnel v${BuildConfig.VERSION_NAME}")
-            .setMessage(
-                "Радар бесплатных VPN-нод.\n" +
-                    "VLESS / Trojan / Hy2 / VMess / SS · TCP-пинг · one-tap best.\n\n" +
-                    "https://github.com/${BuildConfig.GITHUB_REPO}"
-            )
-            .setPositiveButton("GitHub") { _, _ ->
-                try {
+                R.id.action_filter -> {
+                    val options = arrayOf("Все", "≤ 100 ms", "≤ 200 ms", "≤ 300 ms", "≤ 500 ms")
+                    val values = intArrayOf(Int.MAX_VALUE, 100, 200, 300, 500)
+                    MaterialAlertDialogBuilder(this)
+                        .setTitle("Фильтр по пингу")
+                        .setItems(options) { _, which ->
+                            maxPingFilter = values[which]
+                            filteredList = if (maxPingFilter == Int.MAX_VALUE) configsList
+                            else configsList.filter { it.pingMs in 1..maxPingFilter }
+                            recyclerView.adapter = ConfigAdapter(this, filteredList)
+                            updateSubtitle()
+                        }
+                        .show()
+                    true
+                }
+                R.id.action_copy_all -> {
+                    if (filteredList.isEmpty()) {
+                        Toast.makeText(this, R.string.no_configs, Toast.LENGTH_SHORT).show()
+                    } else {
+                        ConfigLauncher.copy(
+                            this,
+                            filteredList.take(30).joinToString("\n") { it.url }
+                        )
+                        Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
+                    }
+                    true
+                }
+                R.id.action_share -> {
                     startActivity(
-                        Intent(
-                            Intent.ACTION_VIEW,
-                            Uri.parse("https://github.com/${BuildConfig.GITHUB_REPO}")
+                        Intent.createChooser(
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(
+                                    Intent.EXTRA_TEXT,
+                                    filteredList.take(20).joinToString("\n") { it.url }
+                                )
+                            },
+                            "Поделиться"
                         )
                     )
-                } catch (_: Exception) {
+                    true
                 }
+                else -> false
             }
-            .setNegativeButton("OK", null)
-            .show()
+        }
     }
 }

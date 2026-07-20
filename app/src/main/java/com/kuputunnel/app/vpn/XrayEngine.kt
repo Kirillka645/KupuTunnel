@@ -107,22 +107,30 @@ object XrayEngine {
                 "startLoop ${built.protocol} ${built.host}:${built.port} " +
                     "tunFd=$tunFd useTun=$useTun jsonLen=${built.json.length}"
             )
-            // Пишем конфиг для отладки
             try {
                 File(context.filesDir, "last_xray_config.json").writeText(built.json)
             } catch (_: Exception) {
             }
+
+            // DNS resolve host before start (sync, on worker thread already)
+            // — уже в builder.resolveHostIps
 
             val startLoop = core.javaClass.getMethod(
                 "startLoop",
                 String::class.java,
                 Int::class.javaPrimitiveType
             )
-            startLoop.invoke(core, built.json, tunFd)
+            try {
+                startLoop.invoke(core, built.json, tunFd)
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                val cause = e.cause ?: e
+                Log.e(TAG, "startLoop threw", cause)
+                return Result.failure(cause)
+            }
 
             // Дать core подняться
             var ok = false
-            repeat(10) {
+            repeat(20) {
                 Thread.sleep(50)
                 if (isRunning()) {
                     ok = true
@@ -130,7 +138,11 @@ object XrayEngine {
                 }
             }
             if (!ok) {
-                return Result.failure(IllegalStateException("Xray не запустился (isRunning=false)"))
+                return Result.failure(
+                    IllegalStateException(
+                        "Xray не запустился. См. last_xray_config.json"
+                    )
+                )
             }
 
             runningConfig = shareLink

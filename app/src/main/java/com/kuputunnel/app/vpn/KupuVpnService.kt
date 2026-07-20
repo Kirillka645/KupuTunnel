@@ -10,35 +10,47 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.kuputunnel.app.MainActivity
 import com.kuputunnel.app.R
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * System VPN:
- * - startForeground с correct FGS type (иначе Android 14 убивает сервис через ~5с)
- * - Xray на background thread
- * - null intent / restart не роняет VPN
- * - addDisallowedApplication + server IP в direct (routing)
+ * Стабильный VPN-сервис.
+ * - FGS type для Android 14+
+ * - Не стопается при null-intent restart
+ * - Нет «health restart» thrashing
+ * - WakeLock на время старта
  */
 class KupuVpnService : VpnService() {
 
     private var tun: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
+    private var wakeLock: PowerManager.WakeLock? = null
     private val worker = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "kupu-vpn-worker").apply { isDaemon = true }
+        Thread(r, "kupu-vpn").apply { isDaemon = true }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        ensureChannel()
+        try {
+            startAsForeground("KupuTunnel VPN")
+        } catch (e: Exception) {
+            Log.e(TAG, "fg onCreate", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Сразу foreground — дедлайн 5–10с на Android 12+
         try {
             startAsForeground("KupuTunnel…")
         } catch (e: Exception) {
-            Log.e(TAG, "startForeground failed", e)
+            Log.e(TAG, "fg start", e)
         }
 
         when (intent?.action) {
@@ -51,26 +63,22 @@ class KupuVpnService : VpnService() {
             }
             else -> {
                 val link = intent?.getStringExtra(EXTRA_CONFIG)
+                    ?: VpnSession.loadPersisted(this)
                     ?: VpnSession.pendingConfig
                     ?: VpnSession.activeConfig
+
                 if (link.isNullOrBlank()) {
-                    // Рестарт без extras: если уже подключены — не трогаем
-                    if (running.get() && XrayEngine.isRunning()) {
-                        Log.i(TAG, "restart with null intent, keep running")
-                        return START_STICKY
-                    }
-                    Log.e(TAG, "no config")
+                    if (running.get()) return START_STICKY
+                    log("no config, stop")
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                // Уже на этом же конфиге — ок
-                if (running.get() &&
-                    XrayEngine.isRunning() &&
-                    VpnSession.activeConfig == link
-                ) {
+
+                if (running.get() && VpnSession.activeConfig == link) {
                     updateNotification("VPN · ${VpnSession.activeProtocol} · ${VpnSession.activeRemark}")
                     return START_STICKY
                 }
+
                 worker.execute { startVpnInternal(link) }
             }
         }
@@ -78,7 +86,7 @@ class KupuVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        Log.w(TAG, "onRevoke")
+        log("onRevoke")
         worker.execute {
             stopVpnInternal()
             stopSelf()
@@ -87,18 +95,35 @@ class KupuVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        worker.execute { stopVpnInternal() }
+        // Не гасим core синхронно — только флаги; worker сделает cleanup
+        try {
+            running.set(false)
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
         super.onDestroy()
     }
 
     private fun startVpnInternal(shareLink: String) {
+        acquireWake()
         try {
             if (running.get()) {
-                stopVpnInternal()
+                // уже на другом узле — мягкий restart
+                try {
+                    XrayEngine.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    tun?.close()
+                } catch (_: Exception) {
+                }
+                tun = null
+                running.set(false)
+                Thread.sleep(300)
             }
 
             if (prepare(this) != null) {
-                Log.e(TAG, "VPN permission missing")
+                log("permission missing")
                 broadcast(STATE_FAILED, "Нет разрешения VPN")
                 stopForegroundSafe()
                 stopSelf()
@@ -108,60 +133,50 @@ class KupuVpnService : VpnService() {
             val builder = Builder()
                 .setSession("KupuTunnel")
                 .setMtu(1500)
-                // TUN address
                 .addAddress("10.10.14.2", 30)
-                // full tunnel IPv4
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
-                // Свой процесс не в туннель — Xray ходит наружу напрямую
-                .addDisallowedApplication(packageName)
+
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.setBlocking(false)
-            }
-
-            try {
-                tun?.close()
-            } catch (_: Exception) {
-            }
 
             val pfd = builder.establish()
             if (pfd == null) {
-                broadcast(STATE_FAILED, "Не удалось создать TUN")
+                log("establish() null")
+                broadcast(STATE_FAILED, "TUN establish failed")
                 stopForegroundSafe()
                 stopSelf()
                 return
             }
             tun = pfd
-            Log.i(TAG, "TUN established fd=${pfd.fd}")
+            log("TUN fd=${pfd.fd}")
 
-            // Сначала пробуем с TUN fd
+            // TUN mode
             var result = XrayEngine.start(this, shareLink, pfd.fd, useTun = true)
             if (result.isFailure) {
-                Log.w(TAG, "tun mode failed: ${result.exceptionOrNull()?.message}, retry socks-only")
-                // Fallback: только socks, TUN fd=0 (трафик всё равно через TUN apps →
-                // без tun inbound не пойдёт; но хотя бы core жив)
-                // Лучше: оставить TUN + socks, но fd=0 если tun inbound не поддерживается
+                log("tun start fail: ${result.exceptionOrNull()?.message}")
+                // retry once without tun inbound, fd still open for system
                 result = XrayEngine.start(this, shareLink, 0, useTun = false)
-                if (result.isFailure) {
-                    Log.e(TAG, "core fail", result.exceptionOrNull())
-                    try {
-                        pfd.close()
-                    } catch (_: Exception) {
-                    }
-                    tun = null
-                    broadcast(STATE_FAILED, result.exceptionOrNull()?.message ?: "Xray error")
-                    stopForegroundSafe()
-                    stopSelf()
-                    return
+            }
+
+            if (result.isFailure) {
+                log("xray fail: ${result.exceptionOrNull()?.message}")
+                try {
+                    pfd.close()
+                } catch (_: Exception) {
                 }
-                // socks-only + full tunnel без tun inbound = нет интернета
-                // → показываем ошибку честно
-                Log.e(TAG, "running without tun inbound — network may not work")
+                tun = null
+                broadcast(STATE_FAILED, shortErr(result.exceptionOrNull()))
+                stopForegroundSafe()
+                stopSelf()
+                return
             }
 
             val built = result.getOrThrow()
@@ -170,27 +185,17 @@ class KupuVpnService : VpnService() {
             VpnSession.activeConfig = shareLink
             VpnSession.activeRemark = built.remark.ifBlank { "${built.host}:${built.port}" }
             VpnSession.activeProtocol = built.protocol
+            VpnSession.persist(this, shareLink)
             updateNotification("VPN · ${built.protocol} · ${VpnSession.activeRemark}")
             broadcast(STATE_CONNECTED, VpnSession.activeRemark)
-            Log.i(TAG, "VPN up ${built.protocol} ${built.host}:${built.port} ips=${built.serverIps}")
-
-            // Лёгкий health-check: если core умер через 2с — перезапуск
-            worker.execute {
-                try {
-                    Thread.sleep(2500)
-                    if (running.get() && !XrayEngine.isRunning()) {
-                        Log.w(TAG, "core died, restarting…")
-                        val link = VpnSession.activeConfig ?: return@execute
-                        startVpnInternal(link)
-                    }
-                } catch (_: Exception) {
-                }
-            }
+            log("UP ${built.protocol} ${built.host}:${built.port}")
         } catch (e: Exception) {
-            Log.e(TAG, "startVpn", e)
+            log("startVpn error: ${e.message}")
             stopVpnInternal()
             broadcast(STATE_FAILED, e.message ?: "error")
             stopSelf()
+        } finally {
+            releaseWake()
         }
     }
 
@@ -208,20 +213,39 @@ class KupuVpnService : VpnService() {
         VpnSession.clearActive()
         broadcast(STATE_DISCONNECTED, "")
         stopForegroundSafe()
-        Log.i(TAG, "VPN down")
+        log("DOWN")
+    }
+
+    private fun acquireWake() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kuputunnel:vpn").apply {
+                setReferenceCounted(false)
+                acquire(60_000L)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseWake() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        wakeLock = null
     }
 
     private fun startAsForeground(text: String) {
-        val notification = buildNotification(text)
+        val n = buildNotification(text)
         if (Build.VERSION.SDK_INT >= 34) {
             ServiceCompat.startForeground(
                 this,
                 NOTIF_ID,
-                notification,
+                n,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             )
         } else {
-            startForeground(NOTIF_ID, notification)
+            startForeground(NOTIF_ID, n)
         }
     }
 
@@ -240,14 +264,12 @@ class KupuVpnService : VpnService() {
     private fun buildNotification(text: String): Notification {
         ensureChannel()
         val open = PendingIntent.getActivity(
-            this,
-            0,
+            this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val stop = PendingIntent.getService(
-            this,
-            1,
+            this, 1,
             Intent(this, KupuVpnService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -260,14 +282,14 @@ class KupuVpnService : VpnService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
 
     private fun updateNotification(text: String) {
         try {
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(NOTIF_ID, buildNotification(text))
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                .notify(NOTIF_ID, buildNotification(text))
         } catch (_: Exception) {
         }
     }
@@ -275,13 +297,10 @@ class KupuVpnService : VpnService() {
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val ch = NotificationChannel(
-            CHANNEL_ID,
-            "KupuTunnel VPN",
-            NotificationManager.IMPORTANCE_LOW
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "KupuTunnel VPN", NotificationManager.IMPORTANCE_LOW)
+                .apply { setShowBadge(false) }
         )
-        ch.setShowBadge(false)
-        nm.createNotificationChannel(ch)
     }
 
     private fun broadcast(state: String, message: String) {
@@ -295,6 +314,19 @@ class KupuVpnService : VpnService() {
         }
     }
 
+    private fun log(msg: String) {
+        Log.i(TAG, msg)
+        try {
+            File(filesDir, "vpn.log").appendText("${System.currentTimeMillis()} $msg\n")
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun shortErr(t: Throwable?): String {
+        val m = t?.message ?: return "Xray error"
+        return m.take(120)
+    }
+
     companion object {
         private const val TAG = "KupuVpnService"
         private const val CHANNEL_ID = "kuputunnel_vpn"
@@ -306,13 +338,13 @@ class KupuVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
-
         const val STATE_CONNECTED = "connected"
         const val STATE_DISCONNECTED = "disconnected"
         const val STATE_FAILED = "failed"
 
         fun start(context: Context, shareLink: String) {
             VpnSession.pendingConfig = shareLink
+            VpnSession.persist(context, shareLink)
             val i = Intent(context, KupuVpnService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_CONFIG, shareLink)
@@ -337,6 +369,9 @@ class KupuVpnService : VpnService() {
 }
 
 object VpnSession {
+    private const val PREFS = "vpn_session"
+    private const val KEY_LINK = "link"
+
     @Volatile var pendingConfig: String? = null
     @Volatile var activeConfig: String? = null
     @Volatile var activeRemark: String = ""
@@ -348,5 +383,21 @@ object VpnSession {
         activeConfig = null
         activeRemark = ""
         activeProtocol = ""
+    }
+
+    fun persist(context: Context, link: String) {
+        pendingConfig = link
+        try {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString(KEY_LINK, link).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    fun loadPersisted(context: Context): String? = try {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_LINK, null)
+    } catch (_: Exception) {
+        null
     }
 }

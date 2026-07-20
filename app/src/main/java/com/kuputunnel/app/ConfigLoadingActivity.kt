@@ -28,6 +28,7 @@ class ConfigLoadingActivity : AppCompatActivity() {
 
     private var job: Job? = null
     private var autoConnectBest = false
+    private var title: String = "Скан"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,7 +42,7 @@ class ConfigLoadingActivity : AppCompatActivity() {
         btnCancel = findViewById(R.id.btnCancel)
 
         val mode = intent.getStringExtra(MainActivity.EXTRA_MODE) ?: MainActivity.MODE_MEGA
-        val title = intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME) ?: "Загрузка"
+        title = intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME) ?: "Загрузка"
         val sourceId = intent.getStringExtra(MainActivity.EXTRA_SOURCE_ID)
         val profileName = intent.getStringExtra(MainActivity.EXTRA_PROFILE)
             ?: NetworkProfileMode.AUTO.name
@@ -63,17 +64,17 @@ class ConfigLoadingActivity : AppCompatActivity() {
             try {
                 runPipeline(mode, sourceId, profileMode, offline)
             } catch (_: CancellationException) {
-            } catch (e: TimeoutCancellationException) {
-                Toast.makeText(this@ConfigLoadingActivity, "Таймаут загрузки", Toast.LENGTH_LONG)
+            } catch (_: TimeoutCancellationException) {
+                Toast.makeText(this@ConfigLoadingActivity, "Таймаут — попробуй снова", Toast.LENGTH_LONG)
                     .show()
-                finish()
+                openListOrHome(emptyList())
             } catch (e: Exception) {
                 Toast.makeText(
                     this@ConfigLoadingActivity,
-                    "Ошибка: ${e.message}",
+                    "Ошибка: ${e.message?.take(80)}",
                     Toast.LENGTH_LONG
                 ).show()
-                finish()
+                openListOrHome(emptyList())
             }
         }
     }
@@ -86,30 +87,21 @@ class ConfigLoadingActivity : AppCompatActivity() {
     ) {
         val settings = ProfileSettings.forMode(profileMode, this)
         progressLinear.isIndeterminate = true
-        tvStatus.text = "Загрузка парсеров…"
+        tvStatus.text = "Загрузка…"
 
-        // Общий лимит: не висим больше 45с на fetch
-        val raw: List<String> = withTimeout(45_000L) {
+        val raw: List<String> = withTimeout(35_000L) {
             when (mode) {
-                MainActivity.MODE_SOURCE -> {
-                    tvStatus.text = "Источник: $sourceId"
-                    withTimeout(20_000L) {
-                        ConfigManager.fetchSourceById(sourceId ?: "", this@ConfigLoadingActivity)
-                    }
+                MainActivity.MODE_SOURCE -> withTimeout(15_000L) {
+                    ConfigManager.fetchSourceById(sourceId ?: "", this@ConfigLoadingActivity)
                 }
                 MainActivity.MODE_OFFLINE -> offline ?: emptyList()
                 else -> {
-                    val result = withTimeout(40_000L) {
+                    val result = withTimeout(30_000L) {
                         ConfigManager.fetchAllSources(this@ConfigLoadingActivity) { idx, total, name, count ->
-                            // уже на Main из ConfigManager
-                            tvStatus.text = "[$idx/$total] $name → $count"
+                            tvStatus.text = "[$idx/$total] $name · $count"
                         }
                     }
-                    tvStatus.text = buildString {
-                        append("Собрано ${result.configs.size}")
-                        if (result.fromCache) append(" · +кэш")
-                        if (result.fromSeed) append(" · +seed")
-                    }
+                    tvStatus.text = "Собрано ${result.configs.size}"
                     result.configs
                 }
             }
@@ -121,15 +113,15 @@ class ConfigLoadingActivity : AppCompatActivity() {
             return
         }
 
-        val toCheck = ConfigManager.prepareForProfile(raw, settings)
+        // Жёсткий лимит — меньше RAM, быстрее, без краша
+        val toCheck = ConfigManager.prepareForProfile(raw, settings).take(settings.maxToCheck)
         tvTitle.text = getString(R.string.checking_title)
-        tvStatus.text = "TCP-пинг ${toCheck.size} узлов…"
+        tvStatus.text = "Пинг ${toCheck.size} узлов…"
         progressLinear.isIndeterminate = false
         progressLinear.max = 100
         progressLinear.progress = 0
 
-        // Пинг: лимит 60с
-        val working = withTimeout(60_000L) {
+        val working = withTimeout(50_000L) {
             ConfigManager.checkConfigsParallel(
                 configs = toCheck,
                 settings = settings,
@@ -137,7 +129,7 @@ class ConfigLoadingActivity : AppCompatActivity() {
                 onProgress = { processed, total, alive ->
                     val pct = if (total > 0) (processed * 100 / total) else 0
                     progressLinear.progress = pct
-                    tvStatus.text = "Проверено $processed / $total"
+                    tvStatus.text = "$processed / $total"
                     tvLive.text = "Живых: $alive"
                 }
             )
@@ -146,32 +138,43 @@ class ConfigLoadingActivity : AppCompatActivity() {
         val profileForCache =
             if (settings.mode == NetworkProfileMode.MOBILE) NetworkProfileMode.MOBILE
             else NetworkProfileMode.WIFI
-        if (working.isNotEmpty()) {
-            withContext(Dispatchers.IO) {
-                ConfigCache.saveWorking(this@ConfigLoadingActivity, profileForCache, working)
+
+        // Только топ-80 — в файл, НЕ в Intent
+        val top = working.sortedBy { it.pingMs }.take(80)
+        withContext(Dispatchers.IO) {
+            if (top.isNotEmpty()) {
+                ConfigCache.saveWorking(this@ConfigLoadingActivity, profileForCache, top)
             }
+            ScanResultStore.save(
+                this@ConfigLoadingActivity,
+                top,
+                title,
+                autoConnect = autoConnectBest && top.isNotEmpty()
+            )
         }
 
-        if (working.isEmpty()) {
-            Toast.makeText(
-                this,
-                "Живых узлов не найдено — попробуй другой источник",
-                Toast.LENGTH_LONG
-            ).show()
+        if (top.isEmpty()) {
+            Toast.makeText(this, "Живых узлов нет", Toast.LENGTH_LONG).show()
             finish()
             return
         }
 
-        startActivity(
-            Intent(this, ConfigListActivity::class.java).apply {
-                putExtra(
-                    MainActivity.EXTRA_SOURCE_NAME,
-                    intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME)
-                )
-                putExtra(MainActivity.EXTRA_CONFIGS, ArrayList(working))
-                putExtra(MainActivity.EXTRA_AUTO_CONNECT, autoConnectBest)
-            }
-        )
+        openListOrHome(top)
+    }
+
+    private fun openListOrHome(list: List<ConfigWithPing>) {
+        try {
+            // Только флаги — список уже в ScanResultStore
+            startActivity(
+                Intent(this, ConfigListActivity::class.java).apply {
+                    putExtra(MainActivity.EXTRA_SOURCE_NAME, title)
+                    putExtra(MainActivity.EXTRA_LOAD_FROM_STORE, true)
+                    // НЕ кладём ArrayList конфигов — TransactionTooLargeException
+                }
+            )
+        } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось открыть список: ${e.message}", Toast.LENGTH_LONG).show()
+        }
         finish()
     }
 
