@@ -3,13 +3,15 @@ package com.kuputunnel.app.vpn
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetAddress
 import java.net.URI
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Share-link → Xray JSON (как в Happ: VLESS Reality / VMess / Trojan / SS / Socks).
- * Архитектура ядра как у Hiddify: TUN inbound + proxy outbound + routing.
+ * Share-link → Xray JSON.
+ * SOCKS local + optional TUN (fd via xray.tun.fd).
+ * Proxy server IP уходит в direct, чтобы не было routing-loop.
  */
 object XrayConfigBuilder {
 
@@ -18,10 +20,11 @@ object XrayConfigBuilder {
         val protocol: String,
         val remark: String,
         val host: String,
-        val port: Int
+        val port: Int,
+        val serverIps: List<String>
     )
 
-    fun build(shareLink: String, socksPort: Int = 10808): Built? {
+    fun build(shareLink: String, socksPort: Int = 10808, useTun: Boolean = true): Built? {
         val link = shareLink.trim()
         val lower = link.lowercase()
         val outbound = when {
@@ -33,9 +36,17 @@ object XrayConfigBuilder {
             else -> null
         } ?: return null
 
+        val serverIps = resolveHostIps(outbound.host)
+
         val root = JSONObject()
         root.put("stats", JSONObject())
-        root.put("log", JSONObject().put("loglevel", "warning"))
+        root.put(
+            "log",
+            JSONObject()
+                .put("loglevel", "warning")
+                .put("access", "none")
+                .put("error", "")
+        )
         root.put(
             "policy",
             JSONObject()
@@ -44,10 +55,10 @@ object XrayConfigBuilder {
                     JSONObject().put(
                         "8",
                         JSONObject()
-                            .put("handshake", 4)
+                            .put("handshake", 8)
                             .put("connIdle", 300)
-                            .put("uplinkOnly", 1)
-                            .put("downlinkOnly", 1)
+                            .put("uplinkOnly", 2)
+                            .put("downlinkOnly", 5)
                     )
                 )
                 .put(
@@ -59,10 +70,10 @@ object XrayConfigBuilder {
         )
 
         val inbounds = JSONArray()
-        // SOCKS (fallback / apps)
+        // Local SOCKS — всегда, стабильнее
         inbounds.put(
             JSONObject()
-                .put("tag", "socks")
+                .put("tag", "socks-in")
                 .put("port", socksPort)
                 .put("listen", "127.0.0.1")
                 .put("protocol", "socks")
@@ -77,28 +88,39 @@ object XrayConfigBuilder {
                     "sniffing",
                     JSONObject()
                         .put("enabled", true)
-                        .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                        .put("destOverride", JSONArray().put("http").put("tls"))
+                        .put("routeOnly", false)
                 )
         )
-        // TUN — fd приходит через xray.tun.fd (AndroidLibXrayLite)
+        // HTTP inbound (некоторые клиенты/диагностика)
         inbounds.put(
             JSONObject()
-                .put("tag", "tun")
-                .put("protocol", "tun")
-                .put(
-                    "settings",
-                    JSONObject()
-                        .put("name", "kupu0")
-                        .put("MTU", 1500)
-                        .put("userLevel", 8)
-                )
-                .put(
-                    "sniffing",
-                    JSONObject()
-                        .put("enabled", true)
-                        .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
-                )
+                .put("tag", "http-in")
+                .put("port", socksPort + 1)
+                .put("listen", "127.0.0.1")
+                .put("protocol", "http")
+                .put("settings", JSONObject().put("userLevel", 8))
         )
+        if (useTun) {
+            // Xray-core Android: fd из env xray.tun.fd
+            inbounds.put(
+                JSONObject()
+                    .put("tag", "tun-in")
+                    .put("protocol", "tun")
+                    .put(
+                        "settings",
+                        JSONObject()
+                            .put("mtu", 8500)
+                            .put("userLevel", 8)
+                    )
+                    .put(
+                        "sniffing",
+                        JSONObject()
+                            .put("enabled", true)
+                            .put("destOverride", JSONArray().put("http").put("tls"))
+                    )
+            )
+        }
         root.put("inbounds", inbounds)
 
         val outbounds = JSONArray()
@@ -107,43 +129,73 @@ object XrayConfigBuilder {
             JSONObject()
                 .put("tag", "direct")
                 .put("protocol", "freedom")
-                .put("settings", JSONObject().put("domainStrategy", "UseIP"))
+                .put("settings", JSONObject().put("domainStrategy", "UseIPv4"))
+                .put("streamSettings", JSONObject().put("sockopt", JSONObject().put("mark", 255)))
         )
         outbounds.put(
             JSONObject()
                 .put("tag", "block")
                 .put("protocol", "blackhole")
-                .put("settings", JSONObject().put("response", JSONObject().put("type", "http")))
         )
         root.put("outbounds", outbounds)
 
+        val rules = JSONArray()
+        // 1) private → direct
+        rules.put(
+            JSONObject()
+                .put("type", "field")
+                .put("outboundTag", "direct")
+                .put("ip", JSONArray().put("geoip:private"))
+        )
+        // 2) proxy server IP → direct (anti routing-loop)
+        if (serverIps.isNotEmpty()) {
+            val arr = JSONArray()
+            serverIps.forEach { arr.put(it) }
+            rules.put(
+                JSONObject()
+                    .put("type", "field")
+                    .put("outboundTag", "direct")
+                    .put("ip", arr)
+            )
+        }
+        // 3) domain of server if hostname
+        if (!isIpLiteral(outbound.host)) {
+            rules.put(
+                JSONObject()
+                    .put("type", "field")
+                    .put("outboundTag", "direct")
+                    .put("domain", JSONArray().put("full:${outbound.host}"))
+            )
+        }
+        // 4) rest → proxy
+        rules.put(
+            JSONObject()
+                .put("type", "field")
+                .put("outboundTag", "proxy")
+                .put("network", "tcp,udp")
+        )
         root.put(
             "routing",
             JSONObject()
                 .put("domainStrategy", "AsIs")
-                .put(
-                    "rules",
-                    JSONArray()
-                        .put(
-                            JSONObject()
-                                .put("type", "field")
-                                .put("outboundTag", "direct")
-                                .put("ip", JSONArray().put("geoip:private"))
-                        )
-                        .put(
-                            JSONObject()
-                                .put("type", "field")
-                                .put("outboundTag", "proxy")
-                                .put("network", "tcp,udp")
-                        )
-                )
+                .put("rules", rules)
         )
 
+        // DNS через proxy, fallback direct
+        val dnsServers = JSONArray()
+        dnsServers.put(
+            JSONObject()
+                .put("address", "1.1.1.1")
+                .put("domains", JSONArray().put("geosite:geolocation-!cn"))
+        )
+        dnsServers.put("8.8.8.8")
+        dnsServers.put("localhost")
         root.put(
             "dns",
             JSONObject()
-                .put("servers", JSONArray().put("1.1.1.1").put("8.8.8.8"))
-                .put("queryStrategy", "UseIP")
+                .put("servers", dnsServers)
+                .put("queryStrategy", "UseIPv4")
+                .put("disableCache", false)
         )
 
         return Built(
@@ -151,8 +203,27 @@ object XrayConfigBuilder {
             protocol = outbound.protocol,
             remark = outbound.remark,
             host = outbound.host,
-            port = outbound.port
+            port = outbound.port,
+            serverIps = serverIps
         )
+    }
+
+    private fun resolveHostIps(host: String): List<String> {
+        if (isIpLiteral(host)) return listOf(host)
+        return try {
+            InetAddress.getAllByName(host).mapNotNull { it.hostAddress }.distinct().take(8)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun isIpLiteral(host: String): Boolean {
+        if (host.isBlank()) return false
+        // v4
+        if (host.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$"""))) return true
+        // v6 rough
+        if (host.contains(":")) return true
+        return false
     }
 
     private data class Out(
@@ -172,14 +243,20 @@ object XrayConfigBuilder {
         val remark = fragment(uri)
         val encryption = q["encryption"] ?: "none"
         val flow = q["flow"]
-        val network = (q["type"] ?: "tcp").ifBlank { "tcp" }
+        val network = normalizeNetwork(q["type"] ?: "tcp")
         val security = (q["security"] ?: "none").ifBlank { "none" }
 
         val user = JSONObject()
             .put("id", uuid)
             .put("encryption", encryption)
             .put("level", 8)
-        if (!flow.isNullOrBlank()) user.put("flow", flow)
+        if (!flow.isNullOrBlank() && flow != "none") user.put("flow", flow)
+
+        val stream = streamSettings(network, security, q)
+        // vision + non-tcp often breaks — force tcp for vision
+        if (!flow.isNullOrBlank() && flow.contains("vision") && network != "tcp") {
+            stream.put("network", "tcp")
+        }
 
         val outbound = JSONObject()
             .put("tag", "proxy")
@@ -196,8 +273,13 @@ object XrayConfigBuilder {
                     )
                 )
             )
-            .put("streamSettings", streamSettings(network, security, q))
-            .put("mux", JSONObject().put("enabled", false).put("concurrency", -1))
+            .put("streamSettings", stream)
+            .put(
+                "mux",
+                JSONObject()
+                    .put("enabled", false)
+                    .put("concurrency", -1)
+            )
 
         return Out(outbound, "VLESS", remark, host, port)
     }
@@ -216,25 +298,21 @@ object XrayConfigBuilder {
         if (host.isBlank() || port !in 1..65535 || uuid.isBlank()) return null
         val remark = o.optString("ps").ifBlank { host }
         val securityUser = o.optString("scy").ifBlank { "auto" }
-        val network = o.optString("net").ifBlank { "tcp" }
+        val network = normalizeNetwork(o.optString("net").ifBlank { "tcp" })
         val tls = o.optString("tls")
         val sni = o.optString("sni").ifBlank { o.optString("host") }
         val path = o.optString("path").ifBlank { "/" }
         val hostHeader = o.optString("host")
-        val alpn = o.optString("alpn")
-        val fp = o.optString("fp")
-
         val q = mutableMapOf(
             "type" to network,
             "security" to if (tls.equals("tls", true)) "tls" else "none",
             "path" to path,
             "host" to hostHeader,
             "sni" to sni,
-            "alpn" to alpn,
-            "fp" to fp,
+            "alpn" to o.optString("alpn"),
+            "fp" to o.optString("fp"),
             "headerType" to o.optString("type")
         )
-
         val user = JSONObject()
             .put("id", uuid)
             .put("alterId", o.optInt("aid", 0))
@@ -269,7 +347,7 @@ object XrayConfigBuilder {
         val password = uri.userInfo ?: return null
         val q = queryMap(uri)
         val remark = fragment(uri)
-        val network = (q["type"] ?: "tcp").ifBlank { "tcp" }
+        val network = normalizeNetwork(q["type"] ?: "tcp")
         val security = (q["security"] ?: "tls").ifBlank { "tls" }
 
         val server = JSONObject()
@@ -290,34 +368,24 @@ object XrayConfigBuilder {
     }
 
     private fun ssOutbound(link: String): Out? {
-        // ss://base64(method:password)@host:port#remark
-        // ss://method:password@host:port
         val raw = link.removePrefix("ss://").removePrefix("SS://")
-        val remark = if ("#" in raw) {
-            decode(raw.substringAfterLast("#"))
-        } else ""
+        val remark = if ("#" in raw) decode(raw.substringAfterLast("#")) else ""
         val main = raw.substringBefore("#")
-
         val host: String
         val port: Int
         val method: String
         val password: String
-
         if ("@" in main) {
             val userInfoPart = main.substringBeforeLast("@")
             val hostPort = main.substringAfterLast("@")
             host = hostPort.substringBeforeLast(":").trim('[', ']')
             port = hostPort.substringAfterLast(":").filter { it.isDigit() }.toIntOrNull() ?: return null
-            val decodedUser = if (userInfoPart.contains(":")) {
-                userInfoPart
-            } else {
-                decodeBase64ToString(userInfoPart) ?: userInfoPart
-            }
+            val decodedUser = if (userInfoPart.contains(":")) userInfoPart
+            else decodeBase64ToString(userInfoPart) ?: userInfoPart
             method = decodedUser.substringBefore(":")
             password = decodedUser.substringAfter(":", "")
         } else {
             val decoded = decodeBase64ToString(main) ?: return null
-            // method:password@host:port
             if ("@" !in decoded) return null
             val user = decoded.substringBefore("@")
             val hostPort = decoded.substringAfter("@")
@@ -327,27 +395,22 @@ object XrayConfigBuilder {
             port = hostPort.substringAfterLast(":").filter { it.isDigit() }.toIntOrNull() ?: return null
         }
         if (host.isBlank() || port !in 1..65535 || method.isBlank()) return null
-
         val server = JSONObject()
             .put("address", host)
             .put("port", port)
             .put("method", method)
             .put("password", password)
             .put("level", 8)
-            .put("ota", false)
-
         val outbound = JSONObject()
             .put("tag", "proxy")
             .put("protocol", "shadowsocks")
             .put("settings", JSONObject().put("servers", JSONArray().put(server)))
             .put("streamSettings", JSONObject().put("network", "tcp"))
             .put("mux", JSONObject().put("enabled", false))
-
         return Out(outbound, "SS", remark.ifBlank { host }, host, port)
     }
 
     private fun socksOutbound(link: String): Out? {
-        // socks://user:pass@host:port  or socks5://host:port
         val normalized = link
             .replace("socks5://", "socks://", ignoreCase = true)
             .replace("socks4://", "socks://", ignoreCase = true)
@@ -356,33 +419,38 @@ object XrayConfigBuilder {
         val port = if (uri.port > 0) uri.port else 1080
         val remark = fragment(uri).ifBlank { host }
         val userInfo = uri.userInfo
-
         val server = JSONObject()
             .put("address", host)
             .put("port", port)
             .put("level", 8)
         if (!userInfo.isNullOrBlank()) {
-            val user = userInfo.substringBefore(":")
-            val pass = userInfo.substringAfter(":", "")
             server.put(
                 "users",
                 JSONArray().put(
                     JSONObject()
-                        .put("user", user)
-                        .put("pass", pass)
+                        .put("user", userInfo.substringBefore(":"))
+                        .put("pass", userInfo.substringAfter(":", ""))
                         .put("level", 8)
                 )
             )
         }
-
         val outbound = JSONObject()
             .put("tag", "proxy")
             .put("protocol", "socks")
             .put("settings", JSONObject().put("servers", JSONArray().put(server)))
             .put("streamSettings", JSONObject().put("network", "tcp"))
             .put("mux", JSONObject().put("enabled", false))
-
         return Out(outbound, "SOCKS", remark, host, port)
+    }
+
+    private fun normalizeNetwork(raw: String): String {
+        return when (raw.lowercase()) {
+            "h2", "http" -> "h2"
+            "raw", "tcp" -> "tcp"
+            "websocket" -> "ws"
+            "xhttp", "splithttp" -> "xhttp"
+            else -> raw.lowercase()
+        }
     }
 
     private fun streamSettings(
@@ -391,23 +459,18 @@ object XrayConfigBuilder {
         q: Map<String, String>
     ): JSONObject {
         val stream = JSONObject()
-        val net = when (network.lowercase()) {
-            "h2", "http" -> "h2"
-            "raw" -> "tcp"
-            else -> network.lowercase()
-        }
+        val net = normalizeNetwork(network)
         stream.put("network", net)
-        stream.put("security", security.lowercase())
+        stream.put("security", security.lowercase().ifBlank { "none" })
 
         when (net) {
             "ws" -> {
-                val ws = JSONObject()
-                    .put("path", q["path"] ?: "/")
-                    .put(
-                        "headers",
-                        JSONObject().put("Host", q["host"] ?: q["sni"] ?: "")
-                    )
-                stream.put("wsSettings", ws)
+                stream.put(
+                    "wsSettings",
+                    JSONObject()
+                        .put("path", q["path"] ?: "/")
+                        .put("headers", JSONObject().put("Host", q["host"] ?: q["sni"] ?: ""))
+                )
             }
             "grpc" -> {
                 stream.put(
@@ -422,22 +485,17 @@ object XrayConfigBuilder {
                     "httpSettings",
                     JSONObject()
                         .put("path", q["path"] ?: "/")
-                        .put(
-                            "host",
-                            JSONArray().put(q["host"] ?: q["sni"] ?: "")
-                        )
+                        .put("host", JSONArray().put(q["host"] ?: q["sni"] ?: ""))
                 )
             }
-            "xhttp", "splithttp" -> {
-                val xhttp = JSONObject()
+            "xhttp" -> {
+                val x = JSONObject()
                     .put("path", q["path"] ?: "/")
                     .put("host", q["host"] ?: q["sni"] ?: "")
                     .put("mode", q["mode"] ?: "auto")
-                stream.put("xhttpSettings", xhttp)
-                // some cores use splithttpSettings
-                stream.put("splithttpSettings", xhttp)
+                stream.put("xhttpSettings", x)
             }
-            "tcp", "raw" -> {
+            else -> {
                 val headerType = q["headerType"] ?: "none"
                 if (headerType == "http") {
                     stream.put(
@@ -480,18 +538,18 @@ object XrayConfigBuilder {
                 if (!alpn.isNullOrBlank()) {
                     tls.put(
                         "alpn",
-                        JSONArray().apply {
-                            alpn.split(",").forEach { put(it.trim()) }
-                        }
+                        JSONArray().apply { alpn.split(",").forEach { put(it.trim()) } }
                     )
                 }
                 stream.put("tlsSettings", tls)
             }
             "reality" -> {
+                val pbk = q["pbk"] ?: ""
                 val reality = JSONObject()
+                    .put("show", false)
                     .put("serverName", q["sni"] ?: q["host"] ?: "")
-                    .put("fingerprint", q["fp"] ?: "chrome")
-                    .put("publicKey", q["pbk"] ?: "")
+                    .put("fingerprint", q["fp"]?.ifBlank { null } ?: "chrome")
+                    .put("publicKey", pbk)
                     .put("shortId", q["sid"] ?: "")
                     .put("spiderX", q["spx"] ?: "/")
                 stream.put("realitySettings", reality)
@@ -502,14 +560,12 @@ object XrayConfigBuilder {
 
     private fun safeUri(link: String): URI? {
         return try {
-            // encode illegal spaces in fragment etc.
-            val fixed = link.replace(" ", "%20")
-            URI(fixed)
+            URI(link.replace(" ", "%20"))
         } catch (_: Exception) {
             try {
                 val scheme = link.substringBefore("://")
                 val rest = link.substringAfter("://")
-                URI("$scheme://${rest.replace("#", "%23").replace(" ", "%20")}")
+                URI("$scheme://${rest.replace(" ", "%20")}")
             } catch (_: Exception) {
                 null
             }
@@ -527,12 +583,10 @@ object XrayConfigBuilder {
         return map
     }
 
-    private fun fragment(uri: URI): String {
-        return try {
-            decode(uri.rawFragment ?: uri.fragment ?: "")
-        } catch (_: Exception) {
-            uri.fragment.orEmpty()
-        }
+    private fun fragment(uri: URI): String = try {
+        decode(uri.rawFragment ?: uri.fragment ?: "")
+    } catch (_: Exception) {
+        uri.fragment.orEmpty()
     }
 
     private fun decode(s: String): String = try {

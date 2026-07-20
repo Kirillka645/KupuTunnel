@@ -6,8 +6,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Обёртка над AndroidLibXrayLite. Ленивая загрузка native-кода
- * только при connect — не при старте приложения.
+ * Ленивая обёртка над AndroidLibXrayLite.
  */
 object XrayEngine {
 
@@ -21,8 +20,7 @@ object XrayEngine {
 
     fun isRunning(): Boolean = try {
         val c = controller ?: return false
-        val m = c.javaClass.getMethod("getIsRunning")
-        m.invoke(c) as? Boolean == true
+        c.javaClass.getMethod("getIsRunning").invoke(c) as? Boolean == true
     } catch (_: Throwable) {
         false
     }
@@ -34,7 +32,6 @@ object XrayEngine {
         synchronized(initLock) {
             if (initialized.get() && controller != null) return
             try {
-                // go.Seq + libv2ray — грузятся только здесь
                 val seq = Class.forName("go.Seq")
                 seq.getMethod("setContext", Context::class.java)
                     .invoke(null, context.applicationContext)
@@ -53,17 +50,27 @@ object XrayEngine {
                 val handler = java.lang.reflect.Proxy.newProxyInstance(
                     handlerClass.classLoader,
                     arrayOf(handlerClass)
-                ) { _, method, _ ->
+                ) { _, method, args ->
                     when (method.name) {
-                        "startup", "shutdown", "onEmitStatus" -> 0L
+                        "startup" -> {
+                            Log.i(TAG, "core startup callback")
+                            0L
+                        }
+                        "shutdown" -> {
+                            Log.i(TAG, "core shutdown callback")
+                            0L
+                        }
+                        "onEmitStatus" -> {
+                            Log.i(TAG, "status=${args?.getOrNull(0)} msg=${args?.getOrNull(1)}")
+                            0L
+                        }
                         else -> null
                     }
                 }
 
-                val newCtrl = lib.getMethod("newCoreController", handlerClass)
-                controller = newCtrl.invoke(null, handler)
+                controller = lib.getMethod("newCoreController", handlerClass)
+                    .invoke(null, handler)
                 initialized.set(true)
-
                 val ver = lib.getMethod("checkVersionX").invoke(null) as? String
                 Log.i(TAG, "core ready: $ver")
             } catch (e: Throwable) {
@@ -75,18 +82,37 @@ object XrayEngine {
         }
     }
 
-    fun start(context: Context, shareLink: String, tunFd: Int): Result<XrayConfigBuilder.Built> {
+    fun start(
+        context: Context,
+        shareLink: String,
+        tunFd: Int,
+        useTun: Boolean = true
+    ): Result<XrayConfigBuilder.Built> {
         return try {
             init(context)
-            if (isRunning()) stop()
+            // Полный stop перед стартом
+            if (isRunning()) {
+                stopQuiet()
+                Thread.sleep(200)
+            }
 
-            val built = XrayConfigBuilder.build(shareLink)
+            val built = XrayConfigBuilder.build(shareLink, useTun = useTun)
                 ?: return Result.failure(IllegalArgumentException("Не удалось разобрать конфиг"))
 
             val core = controller
                 ?: return Result.failure(IllegalStateException("Core not ready"))
 
-            Log.i(TAG, "start ${built.protocol} ${built.host}:${built.port} tunFd=$tunFd")
+            Log.i(
+                TAG,
+                "startLoop ${built.protocol} ${built.host}:${built.port} " +
+                    "tunFd=$tunFd useTun=$useTun jsonLen=${built.json.length}"
+            )
+            // Пишем конфиг для отладки
+            try {
+                File(context.filesDir, "last_xray_config.json").writeText(built.json)
+            } catch (_: Exception) {
+            }
+
             val startLoop = core.javaClass.getMethod(
                 "startLoop",
                 String::class.java,
@@ -94,9 +120,19 @@ object XrayEngine {
             )
             startLoop.invoke(core, built.json, tunFd)
 
-            if (!isRunning()) {
-                return Result.failure(IllegalStateException("Xray не запустился"))
+            // Дать core подняться
+            var ok = false
+            repeat(10) {
+                Thread.sleep(50)
+                if (isRunning()) {
+                    ok = true
+                    return@repeat
+                }
             }
+            if (!ok) {
+                return Result.failure(IllegalStateException("Xray не запустился (isRunning=false)"))
+            }
+
             runningConfig = shareLink
             runningRemark = built.remark.ifBlank { "${built.host}:${built.port}" }
             Result.success(built)
@@ -108,19 +144,23 @@ object XrayEngine {
     }
 
     fun stop() {
+        stopQuiet()
+        runningConfig = null
+        runningRemark = ""
+    }
+
+    private fun stopQuiet() {
         try {
-            val core = controller
-            if (core != null) {
+            val core = controller ?: return
+            if (isRunning()) {
                 core.javaClass.getMethod("stopLoop").invoke(core)
             }
         } catch (e: Throwable) {
             Log.e(TAG, "stop failed", e)
         }
-        runningConfig = null
-        runningRemark = ""
     }
 
-    fun measureDelay(testUrl: String = "https://www.google.com/generate_204"): Long {
+    fun measureDelay(testUrl: String = "https://www.gstatic.com/generate_204"): Long {
         return try {
             if (!isRunning()) return -1L
             val core = controller ?: return -1L
@@ -140,6 +180,7 @@ object XrayEngine {
                 context.assets.open(name).use { input ->
                     out.outputStream().use { output -> input.copyTo(output) }
                 }
+                Log.i(TAG, "copied asset $name size=${out.length()}")
             } catch (e: Exception) {
                 Log.w(TAG, "asset $name missing: ${e.message}")
             }

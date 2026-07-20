@@ -27,23 +27,24 @@ data class ProfileSettings(
                 else -> mode
             }
             return when (effective) {
+                // Меньше параллелизма = нет ANR/фриза UI
                 NetworkProfileMode.MOBILE -> ProfileSettings(
                     mode = effective,
                     label = "LTE / мобильный",
-                    batchSize = 40,
-                    connectTimeoutMs = 1200,
-                    maxPingMs = 5000,
-                    maxToCheck = 300,
-                    stopWhenFound = 30
+                    batchSize = 16,
+                    connectTimeoutMs = 900,
+                    maxPingMs = 4000,
+                    maxToCheck = 120,
+                    stopWhenFound = 20
                 )
                 else -> ProfileSettings(
                     mode = NetworkProfileMode.WIFI,
                     label = "Wi‑Fi",
-                    batchSize = 64,
-                    connectTimeoutMs = 1500,
-                    maxPingMs = 6000,
-                    maxToCheck = 500,
-                    stopWhenFound = 50
+                    batchSize = 24,
+                    connectTimeoutMs = 1000,
+                    maxPingMs = 5000,
+                    maxToCheck = 180,
+                    stopWhenFound = 30
                 )
             }
         }
@@ -52,7 +53,6 @@ data class ProfileSettings(
             if (context == null) return NetworkProfileMode.WIFI
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                 ?: return NetworkProfileMode.WIFI
-
             return try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     val network = cm.activeNetwork ?: return NetworkProfileMode.WIFI

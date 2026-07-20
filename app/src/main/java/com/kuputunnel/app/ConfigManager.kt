@@ -19,9 +19,11 @@ object ConfigManager {
     private const val MAX_CONFIGS = 20_000
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(12, TimeUnit.SECONDS)
         .followRedirects(true)
+        .retryOnConnectionFailure(true)
         .build()
 
     data class Source(
@@ -32,15 +34,12 @@ object ConfigManager {
         val region: String = "ALL"
     )
 
-    /** CDN-зеркала для raw.githubusercontent */
+    /** 2–3 быстрых зеркала, без длинной цепочки (не зависаем). */
     private fun ghMirrors(owner: String, repo: String, branch: String, path: String): List<String> {
         val raw = "https://raw.githubusercontent.com/$owner/$repo/$branch/$path"
         return listOf(
             "https://cdn.jsdelivr.net/gh/$owner/$repo@$branch/$path",
             "https://fastly.jsdelivr.net/gh/$owner/$repo@$branch/$path",
-            "https://gcore.jsdelivr.net/gh/$owner/$repo@$branch/$path",
-            "https://raw.githack.com/$owner/$repo/$branch/$path",
-            "https://ghproxy.net/$raw",
             raw
         )
     }
@@ -77,31 +76,10 @@ object ConfigManager {
             )
         ),
         Source(
-            id = "matin_hy2",
-            name = "MatinGhanbari Hy2",
-            description = "Hysteria2 · recommended",
-            urls = ghMirrors(
-                "MatinGhanbari", "v2ray-configs", "main",
-                "subscriptions/filtered/subs/hysteria2.txt"
-            )
-        ),
-        Source(
             id = "ebrasha_vless",
             name = "EbraSha VLESS",
             description = "Auto-update public list",
             urls = ghMirrors("ebrasha", "free-v2ray-public-list", "main", "vless_configs.txt")
-        ),
-        Source(
-            id = "ebrasha_trojan",
-            name = "EbraSha Trojan",
-            description = "Trojan public list",
-            urls = ghMirrors("ebrasha", "free-v2ray-public-list", "main", "trojan_configs.txt")
-        ),
-        Source(
-            id = "tgparse_mixed",
-            name = "TGParse Mixed",
-            description = "Telegram channels parser",
-            urls = ghMirrors("Surfboardv2ray", "TGParse", "main", "splitted/mixed")
         ),
         Source(
             id = "tgparse_vless",
@@ -114,19 +92,6 @@ object ConfigManager {
             name = "0xRadikal VLESS",
             description = "Auto every 30m",
             urls = ghMirrors("0xRadikal", "Free-v2ray-Configs", "main", "protocols/vless.txt")
-        ),
-        Source(
-            id = "igareck_main",
-            name = "RU Configs Hub",
-            description = "igareck multi-file list",
-            region = "RU",
-            urls = ghMirrors(
-                "igareck", "vpn-configs-for-russia", "main",
-                "Vless-Reality-White-Lists-Rus.txt"
-            ) + ghMirrors(
-                "igareck", "vpn-configs-for-russia", "main",
-                "Vless-Reality-White-Lists-Rus-Mobile.txt"
-            )
         )
     )
 
@@ -150,6 +115,9 @@ object ConfigManager {
             emptyList<String>() to null
         }
 
+    /**
+     * Параллельная загрузка источников (до 4 сразу) — без зависаний UI.
+     */
     suspend fun fetchAllSources(
         context: Context? = null,
         onProgress: (sourceIndex: Int, total: Int, name: String, count: Int) -> Unit = { _, _, _, _ -> }
@@ -157,27 +125,45 @@ object ConfigManager {
         val all = LinkedHashSet<String>()
         val hits = linkedMapOf<String, Int>()
         val mirrors = mutableListOf<String>()
+        val mutex = Mutex()
+        var done = 0
+        val total = SOURCES.size
+        val gate = Semaphore(4)
 
-        SOURCES.forEachIndexed { index, source ->
-            val (list, mirror) = fetchSource(source)
-            hits[source.name] = list.size
-            all.addAll(list)
-            if (mirror != null) mirrors.add("${source.name} ← $mirror")
-            onProgress(index + 1, SOURCES.size, source.name, list.size)
+        val jobs = SOURCES.map { source ->
+            async {
+                gate.withPermit {
+                    val (list, mirror) = try {
+                        fetchSource(source)
+                    } catch (_: Exception) {
+                        emptyList<String>() to null
+                    }
+                    mutex.withLock {
+                        hits[source.name] = list.size
+                        all.addAll(list)
+                        if (mirror != null) mirrors.add("${source.name} ← $mirror")
+                        done++
+                        val d = done
+                        withContext(Dispatchers.Main) {
+                            onProgress(d, total, source.name, list.size)
+                        }
+                    }
+                }
+            }
         }
+        jobs.awaitAll()
 
         var fromCache = false
         var fromSeed = false
 
-        if (all.size < 30 && context != null) {
+        if (all.size < 20 && context != null) {
             val cached = ConfigCache.loadRawList(context)
             if (cached.isNotEmpty()) {
                 all.addAll(cached)
                 fromCache = true
             }
         }
-
-        if (all.size < 30 && context != null) {
+        if (all.size < 20 && context != null) {
             val seed = ConfigCache.loadSeedFromAssets(context)
             if (seed.isNotEmpty()) {
                 all.addAll(seed)
@@ -386,9 +372,10 @@ object ConfigManager {
         var processed = 0
         var working = 0
         var stop = false
+        var lastUiMs = 0L
 
-        val concurrency = settings.batchSize.coerceIn(16, 80)
-        val connectMs = settings.connectTimeoutMs.coerceIn(500, 3000)
+        val concurrency = settings.batchSize.coerceIn(8, 32)
+        val connectMs = settings.connectTimeoutMs.coerceIn(400, 2000)
         val stopAt = settings.stopWhenFound
         val semaphore = Semaphore(concurrency)
 
@@ -414,7 +401,7 @@ object ConfigManager {
                         }
                         if (
                             ping.ok &&
-                            ping.rttMs in 1 until settings.maxPingMs.coerceAtLeast(4000)
+                            ping.rttMs in 1 until settings.maxPingMs.coerceAtLeast(3000)
                         ) {
                             ConfigWithPing(
                                 url = configUrl,
@@ -430,24 +417,41 @@ object ConfigManager {
                         } else null
                     } else null
 
-                    val (p, w, found) = mutex.withLock {
+                    val snapshot = mutex.withLock {
                         processed++
                         if (item != null) {
                             results.add(item)
                             working++
                             if (stopAt > 0 && working >= stopAt) stop = true
                         }
-                        Triple(processed, working, item)
+                        // UI не чаще 8 раз/сек — иначе Main Thread захлёбывается
+                        val now = System.currentTimeMillis()
+                        val pushUi = now - lastUiMs >= 120 || processed >= total || item != null
+                        if (pushUi) lastUiMs = now
+                        Quad(processed, working, item, pushUi)
                     }
-                    withContext(Dispatchers.Main) {
-                        onProgress(p, total, w)
-                        if (found != null) onFound(found)
+                    if (snapshot.pushUi) {
+                        withContext(Dispatchers.Main) {
+                            onProgress(snapshot.p, total, snapshot.w)
+                            if (snapshot.found != null) onFound(snapshot.found)
+                        }
                     }
                 }
             }
         }
 
         jobs.awaitAll()
+        // финальный progress
+        withContext(Dispatchers.Main) {
+            onProgress(total, total, results.size)
+        }
         results.sortedBy { it.pingMs }
     }
+
+    private data class Quad(
+        val p: Int,
+        val w: Int,
+        val found: ConfigWithPing?,
+        val pushUi: Boolean
+    )
 }

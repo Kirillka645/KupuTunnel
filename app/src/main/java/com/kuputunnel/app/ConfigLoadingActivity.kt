@@ -10,8 +10,12 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.progressindicator.CircularProgressIndicator
 import com.google.android.material.progressindicator.LinearProgressIndicator
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 class ConfigLoadingActivity : AppCompatActivity() {
 
@@ -23,7 +27,6 @@ class ConfigLoadingActivity : AppCompatActivity() {
     private lateinit var btnCancel: MaterialButton
 
     private var job: Job? = null
-    private val liveList = mutableListOf<ConfigWithPing>()
     private var autoConnectBest = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,10 +63,16 @@ class ConfigLoadingActivity : AppCompatActivity() {
             try {
                 runPipeline(mode, sourceId, profileMode, offline)
             } catch (_: CancellationException) {
-                // cancelled
-            } catch (e: Exception) {
-                Toast.makeText(this@ConfigLoadingActivity, "Ошибка: ${e.message}", Toast.LENGTH_LONG)
+            } catch (e: TimeoutCancellationException) {
+                Toast.makeText(this@ConfigLoadingActivity, "Таймаут загрузки", Toast.LENGTH_LONG)
                     .show()
+                finish()
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this@ConfigLoadingActivity,
+                    "Ошибка: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
                 finish()
             }
         }
@@ -79,24 +88,30 @@ class ConfigLoadingActivity : AppCompatActivity() {
         progressLinear.isIndeterminate = true
         tvStatus.text = "Загрузка парсеров…"
 
-        val raw: List<String> = when (mode) {
-            MainActivity.MODE_SOURCE -> {
-                tvStatus.text = "Источник: $sourceId"
-                ConfigManager.fetchSourceById(sourceId ?: "", this)
-            }
-            MainActivity.MODE_OFFLINE -> offline ?: emptyList()
-            else -> {
-                // mega + best
-                val result = ConfigManager.fetchAllSources(this) { idx, total, name, count ->
-                    tvStatus.text = "[$idx/$total] $name → $count"
+        // Общий лимит: не висим больше 45с на fetch
+        val raw: List<String> = withTimeout(45_000L) {
+            when (mode) {
+                MainActivity.MODE_SOURCE -> {
+                    tvStatus.text = "Источник: $sourceId"
+                    withTimeout(20_000L) {
+                        ConfigManager.fetchSourceById(sourceId ?: "", this@ConfigLoadingActivity)
+                    }
                 }
-                val hint = buildString {
-                    append("Собрано ${result.configs.size}")
-                    if (result.fromCache) append(" · +кэш")
-                    if (result.fromSeed) append(" · +seed")
+                MainActivity.MODE_OFFLINE -> offline ?: emptyList()
+                else -> {
+                    val result = withTimeout(40_000L) {
+                        ConfigManager.fetchAllSources(this@ConfigLoadingActivity) { idx, total, name, count ->
+                            // уже на Main из ConfigManager
+                            tvStatus.text = "[$idx/$total] $name → $count"
+                        }
+                    }
+                    tvStatus.text = buildString {
+                        append("Собрано ${result.configs.size}")
+                        if (result.fromCache) append(" · +кэш")
+                        if (result.fromSeed) append(" · +seed")
+                    }
+                    result.configs
                 }
-                tvStatus.text = hint
-                result.configs
             }
         }
 
@@ -113,41 +128,46 @@ class ConfigLoadingActivity : AppCompatActivity() {
         progressLinear.max = 100
         progressLinear.progress = 0
 
-        liveList.clear()
-        val working = ConfigManager.checkConfigsParallel(
-            configs = toCheck,
-            settings = settings,
-            profileLabel = settings.label,
-            onProgress = { processed, total, alive ->
-                val pct = if (total > 0) (processed * 100 / total) else 0
-                progressLinear.progress = pct
-                tvStatus.text = "Проверено $processed / $total"
-                tvLive.text = "Живых: $alive"
-            },
-            onFound = { item ->
-                liveList.add(item)
-                liveList.sortBy { it.pingMs }
-            }
-        )
+        // Пинг: лимит 60с
+        val working = withTimeout(60_000L) {
+            ConfigManager.checkConfigsParallel(
+                configs = toCheck,
+                settings = settings,
+                profileLabel = settings.label,
+                onProgress = { processed, total, alive ->
+                    val pct = if (total > 0) (processed * 100 / total) else 0
+                    progressLinear.progress = pct
+                    tvStatus.text = "Проверено $processed / $total"
+                    tvLive.text = "Живых: $alive"
+                }
+            )
+        }
 
         val profileForCache =
             if (settings.mode == NetworkProfileMode.MOBILE) NetworkProfileMode.MOBILE
             else NetworkProfileMode.WIFI
         if (working.isNotEmpty()) {
-            ConfigCache.saveWorking(this, profileForCache, working)
+            withContext(Dispatchers.IO) {
+                ConfigCache.saveWorking(this@ConfigLoadingActivity, profileForCache, working)
+            }
         }
 
         if (working.isEmpty()) {
-            Toast.makeText(this, "Живых узлов не найдено — попробуй Wi‑Fi / другой источник", Toast.LENGTH_LONG)
-                .show()
+            Toast.makeText(
+                this,
+                "Живых узлов не найдено — попробуй другой источник",
+                Toast.LENGTH_LONG
+            ).show()
             finish()
             return
         }
 
-        // Список сначала — VPN permission удобнее из Activity с launcher
         startActivity(
             Intent(this, ConfigListActivity::class.java).apply {
-                putExtra(MainActivity.EXTRA_SOURCE_NAME, intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME))
+                putExtra(
+                    MainActivity.EXTRA_SOURCE_NAME,
+                    intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME)
+                )
                 putExtra(MainActivity.EXTRA_CONFIGS, ArrayList(working))
                 putExtra(MainActivity.EXTRA_AUTO_CONNECT, autoConnectBest)
             }
