@@ -1,76 +1,70 @@
 package com.kuputunnel.app
 
-import android.content.ActivityNotFoundException
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
+import android.net.VpnService
 import android.widget.Toast
-import java.net.URLEncoder
+import com.kuputunnel.app.vpn.KupuVpnService
+import com.kuputunnel.app.vpn.VpnSession
+import com.kuputunnel.app.vpn.XrayConfigBuilder
 
 /**
- * Открывает конфиг во внешнем VPN-клиенте (v2rayNG / Hiddify / NekoBox).
- * Полный системный VPN-туннель делает сам клиент.
+ * Подключение: системный VPN (Happ/Hiddify-style).
+ * VLESS Reality · VMess · Trojan · Shadowsocks · Socks.
  */
 object ConfigLauncher {
 
-    private val CLIENT_PACKAGES = listOf(
-        "com.v2ray.ang",
-        "com.v2ray.ang.play",
-        "app.hiddify.com",
-        "moe.nb4a",
-        "io.nekohasekai.sfa",
-        "com.github.shadowsocks"
-    )
-
     fun launch(context: Context, configUrl: String): Boolean {
-        // 1) Native scheme (vless://, trojan://, …)
-        if (tryView(context, Uri.parse(configUrl))) return true
-
-        // 2) v2rayNG install-config deep link
-        val encoded = URLEncoder.encode(configUrl, "UTF-8")
-        if (tryView(context, Uri.parse("v2rayng://install-config?url=$encoded"))) return true
-        if (tryView(context, Uri.parse("v2rayng://install-sub?url=$encoded"))) return true
-        if (tryView(context, Uri.parse("hiddify://import/$encoded"))) return true
-        if (tryView(context, Uri.parse("sn://subscription?url=$encoded"))) return true
-
-        // 3) Share to known package
-        for (pkg in CLIENT_PACKAGES) {
-            if (!isInstalled(context, pkg)) continue
-            try {
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_TEXT, configUrl)
-                    setPackage(pkg)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-                return true
-            } catch (_: Exception) {
-            }
+        val built = XrayConfigBuilder.build(configUrl)
+        if (built == null) {
+            Toast.makeText(context, "Неподдерживаемый формат конфига", Toast.LENGTH_LONG).show()
+            return false
         }
 
-        // 4) Generic share chooser
-        try {
-            context.startActivity(
-                Intent.createChooser(
-                    Intent(Intent.ACTION_SEND).apply {
-                        type = "text/plain"
-                        putExtra(Intent.EXTRA_TEXT, configUrl)
-                    },
-                    "Открыть в VPN-клиенте"
-                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+        // Уже подключены к этому же узлу → отключить
+        if (VpnSession.isConnected() && VpnSession.activeConfig == configUrl) {
+            KupuVpnService.stop(context)
+            Toast.makeText(context, "VPN отключается…", Toast.LENGTH_SHORT).show()
             return true
-        } catch (_: Exception) {
         }
 
-        // 5) Clipboard fallback
-        copy(context, configUrl)
-        Toast.makeText(context, R.string.client_missing, Toast.LENGTH_LONG).show()
-        return false
+        VpnSession.pendingConfig = configUrl
+        val prep = VpnService.prepare(context)
+        if (prep != null) {
+            // Разрешение VPN: Activity должна вызвать launcher (см. ConfigListActivity)
+            if (context is Activity) {
+                @Suppress("DEPRECATION")
+                context.startActivityForResult(prep, REQ_VPN_PERMISSION)
+            } else {
+                Toast.makeText(context, "Нужно разрешение VPN", Toast.LENGTH_LONG).show()
+            }
+            return true
+        }
+
+        KupuVpnService.start(context, configUrl)
+        Toast.makeText(
+            context,
+            "VPN · ${built.protocol} · ${built.host}:${built.port}",
+            Toast.LENGTH_SHORT
+        ).show()
+        return true
+    }
+
+    fun onVpnPermissionResult(context: Context, granted: Boolean) {
+        val link = VpnSession.pendingConfig
+        if (!granted || link.isNullOrBlank()) {
+            Toast.makeText(context, "VPN-разрешение не выдано", Toast.LENGTH_LONG).show()
+            return
+        }
+        KupuVpnService.start(context, link)
+        Toast.makeText(context, "VPN подключается…", Toast.LENGTH_SHORT).show()
+    }
+
+    fun disconnect(context: Context) {
+        KupuVpnService.stop(context)
     }
 
     fun copy(context: Context, text: String) {
@@ -78,28 +72,23 @@ object ConfigLauncher {
         cm.setPrimaryClip(ClipData.newPlainText("KupuTunnel", text))
     }
 
-    fun isAnyClientInstalled(context: Context): Boolean =
-        CLIENT_PACKAGES.any { isInstalled(context, it) }
-
-    private fun isInstalled(context: Context, pkg: String): Boolean {
-        return try {
-            context.packageManager.getPackageInfo(pkg, 0)
-            true
-        } catch (_: PackageManager.NameNotFoundException) {
-            false
-        }
-    }
-
-    private fun tryView(context: Context, uri: Uri): Boolean {
-        return try {
+    /** Export в другой клиент (опционально). */
+    fun exportExternal(context: Context, configUrl: String) {
+        try {
             context.startActivity(
-                Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, configUrl)
+                    },
+                    "Экспорт конфига"
+                )
             )
-            true
-        } catch (_: ActivityNotFoundException) {
-            false
         } catch (_: Exception) {
-            false
+            copy(context, configUrl)
+            Toast.makeText(context, R.string.config_copied, Toast.LENGTH_SHORT).show()
         }
     }
+
+    const val REQ_VPN_PERMISSION = 0x71_01
 }

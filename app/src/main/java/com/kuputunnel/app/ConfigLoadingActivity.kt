@@ -144,16 +144,7 @@ class ConfigLoadingActivity : AppCompatActivity() {
             return
         }
 
-        if (autoConnectBest) {
-            val best = working.first()
-            Toast.makeText(
-                this,
-                "Лучший: ${best.host}:${best.port} · ${best.pingMs} ms",
-                Toast.LENGTH_SHORT
-            ).show()
-            ConfigLauncher.launch(this, best.url)
-        }
-
+        // Список сначала — VPN permission удобнее из Activity с launcher
         startActivity(
             Intent(this, ConfigListActivity::class.java).apply {
                 putExtra(MainActivity.EXTRA_SOURCE_NAME, intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME))

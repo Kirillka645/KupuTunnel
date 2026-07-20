@@ -131,7 +131,7 @@ object ConfigManager {
     )
 
     private val LINK_REGEX = Regex(
-        """(?:vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic|wireguard)://[^\s<>"'`)\]#,]+""",
+        """(?:vless|vmess|trojan|ss|ssr|socks5?|hysteria2|hy2|tuic|wireguard)://[^\s<>"'`)\]#,]+""",
         RegexOption.IGNORE_CASE
     )
 
@@ -267,6 +267,8 @@ object ConfigManager {
             lower.startsWith("trojan://") ||
             lower.startsWith("ss://") ||
             lower.startsWith("ssr://") ||
+            lower.startsWith("socks://") ||
+            lower.startsWith("socks5://") ||
             lower.startsWith("hysteria2://") ||
             lower.startsWith("hy2://") ||
             lower.startsWith("tuic://") ||

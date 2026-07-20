@@ -95,7 +95,24 @@ class ConfigAdapter(
                 Toast.makeText(context, R.string.config_copied, Toast.LENGTH_SHORT).show()
             }
 
-            val connect = { ConfigLauncher.launch(context, config.url) }
+            val connect = {
+                if (context is ConfigListActivity) {
+                    val prep = android.net.VpnService.prepare(context)
+                    if (prep != null) {
+                        com.kuputunnel.app.vpn.VpnSession.pendingConfig = config.url
+                        // Activity handles launcher; fallback to startActivityForResult path
+                        ConfigLauncher.launch(context, config.url)
+                    } else {
+                        ConfigLauncher.launch(context, config.url)
+                    }
+                } else {
+                    ConfigLauncher.launch(context, config.url)
+                }
+            }
+            btnConnect.text = if (
+                com.kuputunnel.app.vpn.VpnSession.isConnected() &&
+                com.kuputunnel.app.vpn.VpnSession.activeConfig == config.url
+            ) "Отключить" else context.getString(R.string.connect)
             btnConnect.setOnClickListener { connect() }
             card.setOnClickListener { connect() }
         }

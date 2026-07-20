@@ -7,12 +7,14 @@ import android.os.Bundle
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
+import com.kuputunnel.app.vpn.VpnSession
 
 class ConfigListActivity : AppCompatActivity() {
 
@@ -25,6 +27,12 @@ class ConfigListActivity : AppCompatActivity() {
     private var filteredList: List<ConfigWithPing> = emptyList()
     private var sourceName: String = ""
     private var maxPingFilter = Int.MAX_VALUE
+
+    private val vpnPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        ConfigLauncher.onVpnPermissionResult(this, result.resultCode == RESULT_OK)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,9 +65,21 @@ class ConfigListActivity : AppCompatActivity() {
         recyclerView.adapter = ConfigAdapter(this, filteredList)
 
         fabBest = findViewById(R.id.fabBest)
-        fabBest.setOnClickListener { connectBest() }
+        fabBest.setOnClickListener {
+            if (VpnSession.isConnected()) {
+                ConfigLauncher.disconnect(this)
+            } else {
+                connectBest()
+            }
+        }
+        refreshFab()
 
         setupToolbarMenu()
+
+        // Авто-подключение лучшего после «Лучший VPN»
+        if (intent.getBooleanExtra(MainActivity.EXTRA_AUTO_CONNECT, false) && configsList.isNotEmpty()) {
+            connectBest()
+        }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = finish()
@@ -104,6 +124,28 @@ class ConfigListActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshFab()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == ConfigLauncher.REQ_VPN_PERMISSION) {
+            ConfigLauncher.onVpnPermissionResult(this, resultCode == RESULT_OK)
+            refreshFab()
+        }
+    }
+
+    private fun refreshFab() {
+        if (VpnSession.isConnected()) {
+            fabBest.text = "Отключить VPN"
+        } else {
+            fabBest.text = "⚡ Подключить лучший"
+        }
+    }
+
     private fun connectBest() {
         val best = filteredList.filter { it.pingMs > 0 }.minByOrNull { it.pingMs }
             ?: filteredList.firstOrNull()
@@ -111,9 +153,15 @@ class ConfigListActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.no_configs, Toast.LENGTH_SHORT).show()
             return
         }
-        Toast.makeText(this, "→ ${best.host}:${best.port} · ${best.pingMs} ms", Toast.LENGTH_SHORT)
+        Toast.makeText(this, "VPN → ${best.host}:${best.port} · ${best.pingMs} ms", Toast.LENGTH_SHORT)
             .show()
-        ConfigLauncher.launch(this, best.url)
+        val prep = android.net.VpnService.prepare(this)
+        if (prep != null) {
+            VpnSession.pendingConfig = best.url
+            vpnPermissionLauncher.launch(prep)
+        } else {
+            ConfigLauncher.launch(this, best.url)
+        }
     }
 
     private fun showFilterDialog() {

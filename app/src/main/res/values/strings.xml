@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">KupuTunnel</string>
-    <string name="tagline">Free VPN nodes · VLESS / Reality · one-tap best</string>
+    <string name="tagline">System VPN · VLESS Reality · VMess · Trojan · SS · Socks</string>
     <string name="help">Справка</string>
     <string name="theme">Тема</string>
     <string name="cancel">Отмена</string>
@@ -15,8 +15,8 @@
     <string name="preparing">Подготовка…</string>
     <string name="ping_format">%1$d ms</string>
     <string name="config_copied">Конфиг скопирован</string>
-    <string name="client_missing">Установите v2rayNG, Hiddify или NekoBox</string>
+    <string name="client_missing">Клиент не найден</string>
     <string name="no_configs">Нет конфигов</string>
-    <string name="help_message">KupuTunnel собирает бесплатные VPN-конфиги (VLESS, Trojan, Hysteria2, VMess, Shadowsocks) из открытых парсеров, проверяет TCP-доступность (пинг) и сортирует по скорости.\n\n• Мега-скан — все источники сразу\n• «Лучший» — самый быстрый живой узел\n• Подключить — откроет v2rayNG / Hiddify / NekoBox\n• Можно тапнуть любой узел вручную\n\nИсточники: vansFenix, vpn-configs-for-russia, MatinGhanbari, ebrasha, TGParse, Free-v2ray-Configs.\n\nПолный VPN-туннель — в клиенте (v2rayNG и др.). KupuTunnel — радар лучших нод.</string>
+    <string name="help_message">KupuTunnel — системный VPN (как Happ / Hiddify).\n\nПротоколы:\n• VLESS (Reality / TLS / Vision)\n• VMess\n• Trojan\n• Shadowsocks\n• Socks\n\n• Парсеры публичных списков\n• TCP-пинг и сортировка\n• «Лучший» — подключает самый быстрый как VPN\n• Xray-core внутри (TUN)\n\nИсточники: vansFenix, igareck, MatinGhanbari, ebrasha, TGParse, 0xRadikal.</string>
     <string name="disclaimer">Публичные бесплатные ноды нестабильны и могут быть небезопасны. Не используйте для чувствительных данных. На свой страх и риск.</string>
 </resources>
