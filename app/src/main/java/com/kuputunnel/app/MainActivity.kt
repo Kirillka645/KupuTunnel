@@ -41,19 +41,34 @@ class MainActivity : AppCompatActivity() {
     private var pendingUpdate: GitHubRelease? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        applySavedTheme()
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        try {
+            applySavedTheme()
+            super.onCreate(savedInstanceState)
+            setContentView(R.layout.activity_main)
 
-        updateChecker = UpdateChecker(this, client)
-        apkDownloader = ApkDownloader(this)
-        initViews()
-        bindSourceCards()
-        setupProfileToggle()
-        setupClickListeners()
-        setupVersion()
-        refreshNetworkLabel()
-        checkForUpdates()
+            updateChecker = UpdateChecker(this, client)
+            apkDownloader = ApkDownloader(this)
+            initViews()
+            bindSourceCards()
+            setupProfileToggle()
+            setupClickListeners()
+            setupVersion()
+            refreshNetworkLabel()
+            // обновления не блокируют UI; ошибки сети игнорим
+            try {
+                checkForUpdates()
+            } catch (_: Throwable) {
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e("KupuMain", "onCreate crash", e)
+            try {
+                super.onCreate(savedInstanceState)
+            } catch (_: Throwable) {
+            }
+            Toast.makeText(this, "Ошибка старта: ${e.javaClass.simpleName}: ${e.message}", Toast.LENGTH_LONG)
+                .show()
+            // не finish() сразу — даём увидеть toast
+        }
     }
 
     override fun onResume() {
@@ -99,19 +114,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindSourceCards() {
         fun card(id: Int, title: String, desc: String, sourceId: String) {
-            val root = findViewById<View>(id)
-            root.findViewById<TextView>(R.id.tvSourceTitle).text = title
-            root.findViewById<TextView>(R.id.tvSourceDesc).text = desc
+            val root = findViewById<View>(id) ?: return
+            root.findViewById<TextView>(R.id.tvSourceTitle)?.text = title
+            root.findViewById<TextView>(R.id.tvSourceDesc)?.text = desc
             root.setOnClickListener {
                 startScan(MODE_SOURCE, title, sourceId)
             }
         }
-        card(R.id.cardRuMobile, "🇷🇺 RU Mobile", "White lists · Reality · igareck", "igareck_mobile")
-        card(R.id.cardVans, "🦊 vansFenix", "WVFMINI · @wildVF", "vansfenix")
-        card(R.id.cardMatin, "📦 Matin VLESS", "Filtered subscription", "matin_vless")
-        card(R.id.cardEbrasha, "🔥 EbraSha", "Auto public VLESS", "ebrasha_vless")
-        card(R.id.cardTgparse, "📡 TGParse", "Telegram channels", "tgparse_mixed")
-        card(R.id.cardRadikal, "⚡ 0xRadikal", "Every 30 minutes", "radikal_vless")
+        card(R.id.cardRuMobile, "RU Mobile", "White lists · Reality · igareck", "igareck_mobile")
+        card(R.id.cardVans, "vansFenix", "WVFMINI · wildVF", "vansfenix")
+        card(R.id.cardMatin, "Matin VLESS", "Filtered subscription", "matin_vless")
+        card(R.id.cardEbrasha, "EbraSha", "Auto public VLESS", "ebrasha_vless")
+        card(R.id.cardTgparse, "TGParse", "Telegram channels", "tgparse_mixed")
+        card(R.id.cardRadikal, "0xRadikal", "Every 30 minutes", "radikal_vless")
     }
 
     private fun setupVersion() {

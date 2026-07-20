@@ -220,67 +220,81 @@
             android:textColor="@color/kupu_on_surface_variant"
             android:textSize="12sp" />
 
-        <GridLayout
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:columnCount="2"
-            android:useDefaultMargins="false">
+            android:orientation="vertical">
 
-            <include
-                android:id="@+id/cardRuMobile"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginEnd="6dp"
-                android:layout_marginBottom="12dp" />
+                android:orientation="horizontal"
+                android:layout_marginBottom="12dp">
 
-            <include
-                android:id="@+id/cardVans"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginStart="6dp"
-                android:layout_marginBottom="12dp" />
+                <include
+                    android:id="@+id/cardRuMobile"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp" />
 
-            <include
-                android:id="@+id/cardMatin"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginEnd="6dp"
-                android:layout_marginBottom="12dp" />
+                <include
+                    android:id="@+id/cardVans"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp" />
+            </LinearLayout>
 
-            <include
-                android:id="@+id/cardEbrasha"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginStart="6dp"
-                android:layout_marginBottom="12dp" />
+                android:orientation="horizontal"
+                android:layout_marginBottom="12dp">
 
-            <include
-                android:id="@+id/cardTgparse"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginEnd="6dp"
-                android:layout_marginBottom="12dp" />
+                <include
+                    android:id="@+id/cardMatin"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp" />
 
-            <include
-                android:id="@+id/cardRadikal"
-                layout="@layout/item_source_card"
-                android:layout_width="0dp"
+                <include
+                    android:id="@+id/cardEbrasha"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_columnWeight="1"
-                android:layout_marginStart="6dp"
-                android:layout_marginBottom="12dp" />
-        </GridLayout>
+                android:orientation="horizontal"
+                android:layout_marginBottom="12dp">
+
+                <include
+                    android:id="@+id/cardTgparse"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="6dp" />
+
+                <include
+                    android:id="@+id/cardRadikal"
+                    layout="@layout/item_source_card"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp" />
+            </LinearLayout>
+        </LinearLayout>
 
         <!-- Offline / cache -->
         <TextView

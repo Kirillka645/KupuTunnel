@@ -41,7 +41,6 @@
     <application
         android:name=".KupuApp"
         android:allowBackup="true"
-        android:extractNativeLibs="true"
         android:icon="@drawable/ic_launcher_legacy"
         android:label="@string/app_name"
         android:roundIcon="@drawable/ic_launcher_legacy"

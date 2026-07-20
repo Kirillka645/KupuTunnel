@@ -11,8 +11,8 @@ android {
         applicationId = "com.kuputunnel.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.1.1"
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -24,7 +24,8 @@ android {
         )
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            // x86 для старых эмуляторов + основные ABI
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
         }
     }
 
@@ -54,7 +55,11 @@ android {
 
     packaging {
         jniLibs {
+            // Обязательно: иначе libgojni.so не извлекается и app крашится при load
             useLegacyPackaging = true
+        }
+        resources {
+            excludes += setOf("META-INF/INDEX.LIST", "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
         }
     }
 }
