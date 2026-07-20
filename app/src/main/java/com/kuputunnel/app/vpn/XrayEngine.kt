@@ -7,12 +7,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Ленивая обёртка над AndroidLibXrayLite.
+ * startLoop(config, tunFd) → env xray.tun.fd + core.Start
  */
 object XrayEngine {
 
     private const val TAG = "KupuXray"
     private val initialized = AtomicBoolean(false)
     private val initLock = Any()
+    private val startLock = Any()
 
     @Volatile private var controller: Any? = null
     @Volatile private var runningConfig: String? = null
@@ -53,18 +55,18 @@ object XrayEngine {
                 ) { _, method, args ->
                     when (method.name) {
                         "startup" -> {
-                            Log.i(TAG, "core startup callback")
+                            Log.i(TAG, "core startup")
                             0L
                         }
                         "shutdown" -> {
-                            Log.i(TAG, "core shutdown callback")
+                            Log.i(TAG, "core shutdown")
                             0L
                         }
                         "onEmitStatus" -> {
                             Log.i(TAG, "status=${args?.getOrNull(0)} msg=${args?.getOrNull(1)}")
                             0L
                         }
-                        else -> null
+                        else -> 0L
                     }
                 }
 
@@ -88,77 +90,101 @@ object XrayEngine {
         tunFd: Int,
         useTun: Boolean = true
     ): Result<XrayConfigBuilder.Built> {
-        return try {
-            init(context)
-            // Полный stop перед стартом
-            if (isRunning()) {
-                stopQuiet()
-                Thread.sleep(200)
-            }
-
-            val built = XrayConfigBuilder.build(shareLink, useTun = useTun)
-                ?: return Result.failure(IllegalArgumentException("Не удалось разобрать конфиг"))
-
-            val core = controller
-                ?: return Result.failure(IllegalStateException("Core not ready"))
-
-            Log.i(
-                TAG,
-                "startLoop ${built.protocol} ${built.host}:${built.port} " +
-                    "tunFd=$tunFd useTun=$useTun jsonLen=${built.json.length}"
-            )
-            try {
-                File(context.filesDir, "last_xray_config.json").writeText(built.json)
-            } catch (_: Exception) {
-            }
-
-            // DNS resolve host before start (sync, on worker thread already)
-            // — уже в builder.resolveHostIps
-
-            val startLoop = core.javaClass.getMethod(
-                "startLoop",
-                String::class.java,
-                Int::class.javaPrimitiveType
-            )
-            try {
-                startLoop.invoke(core, built.json, tunFd)
-            } catch (e: java.lang.reflect.InvocationTargetException) {
-                val cause = e.cause ?: e
-                Log.e(TAG, "startLoop threw", cause)
-                return Result.failure(cause)
-            }
-
-            // Дать core подняться
-            var ok = false
-            repeat(20) {
-                Thread.sleep(50)
+        synchronized(startLock) {
+            return try {
+                init(context)
                 if (isRunning()) {
-                    ok = true
-                    return@repeat
+                    stopQuiet()
+                    Thread.sleep(250)
                 }
-            }
-            if (!ok) {
-                return Result.failure(
-                    IllegalStateException(
-                        "Xray не запустился. См. last_xray_config.json"
-                    )
-                )
-            }
 
-            runningConfig = shareLink
-            runningRemark = built.remark.ifBlank { "${built.host}:${built.port}" }
-            Result.success(built)
-        } catch (e: Throwable) {
-            val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
-            Log.e(TAG, "start failed", cause)
-            Result.failure(cause)
+                if (useTun && tunFd < 3) {
+                    return Result.failure(
+                        IllegalArgumentException("Некорректный TUN fd=$tunFd")
+                    )
+                }
+
+                val built = XrayConfigBuilder.build(shareLink, useTun = useTun)
+                    ?: return Result.failure(IllegalArgumentException("Не удалось разобрать конфиг"))
+
+                val core = controller
+                    ?: return Result.failure(IllegalStateException("Core not ready"))
+
+                Log.i(
+                    TAG,
+                    "startLoop ${built.protocol} ${built.host}:${built.port} " +
+                        "tunFd=$tunFd useTun=$useTun jsonLen=${built.json.length} " +
+                        "serverIps=${built.serverIps}"
+                )
+                try {
+                    File(context.filesDir, "last_xray_config.json").writeText(built.json)
+                } catch (_: Exception) {
+                }
+
+                val startLoop = core.javaClass.getMethod(
+                    "startLoop",
+                    String::class.java,
+                    Int::class.javaPrimitiveType
+                )
+                try {
+                    // fd=0 → без TUN (AndroidLibXrayLite)
+                    startLoop.invoke(core, built.json, if (useTun) tunFd else 0)
+                } catch (e: java.lang.reflect.InvocationTargetException) {
+                    val cause = e.cause ?: e
+                    Log.e(TAG, "startLoop threw", cause)
+                    try {
+                        File(context.filesDir, "last_xray_error.txt")
+                            .writeText(cause.stackTraceToString())
+                    } catch (_: Exception) {
+                    }
+                    return Result.failure(cause)
+                }
+
+                // Дать core подняться (до ~2s)
+                var ok = false
+                repeat(40) {
+                    Thread.sleep(50)
+                    if (isRunning()) {
+                        ok = true
+                        return@repeat
+                    }
+                }
+                if (!ok) {
+                    return Result.failure(
+                        IllegalStateException("Xray не запустился (см. last_xray_error.txt)")
+                    )
+                }
+
+                // Доп. пауза — tun endpoint инициализируется async
+                Thread.sleep(200)
+                if (!isRunning()) {
+                    return Result.failure(
+                        IllegalStateException("Xray упал сразу после старта")
+                    )
+                }
+
+                runningConfig = shareLink
+                runningRemark = built.remark.ifBlank { "${built.host}:${built.port}" }
+                Result.success(built)
+            } catch (e: Throwable) {
+                val cause = (e as? java.lang.reflect.InvocationTargetException)?.cause ?: e
+                Log.e(TAG, "start failed", cause)
+                try {
+                    File(context.filesDir, "last_xray_error.txt")
+                        .writeText(cause.stackTraceToString())
+                } catch (_: Exception) {
+                }
+                Result.failure(cause)
+            }
         }
     }
 
     fun stop() {
-        stopQuiet()
-        runningConfig = null
-        runningRemark = ""
+        synchronized(startLock) {
+            stopQuiet()
+            runningConfig = null
+            runningRemark = ""
+        }
     }
 
     private fun stopQuiet() {
@@ -167,6 +193,8 @@ object XrayEngine {
             if (isRunning()) {
                 core.javaClass.getMethod("stopLoop").invoke(core)
             }
+            // дать потокам gVisor сдохнуть
+            Thread.sleep(150)
         } catch (e: Throwable) {
             Log.e(TAG, "stop failed", e)
         }
@@ -185,7 +213,8 @@ object XrayEngine {
 
     private fun prepareAssets(context: Context): File {
         val dir = File(context.filesDir, "xray_assets").also { if (!it.exists()) it.mkdirs() }
-        listOf("geoip.dat", "geosite.dat").forEach { name ->
+        // geo из AAR assets + app assets
+        listOf("geoip.dat", "geosite.dat", "geoip-only-cn-private.dat").forEach { name ->
             val out = File(dir, name)
             if (out.exists() && out.length() > 1024) return@forEach
             try {

@@ -374,75 +374,76 @@ object ConfigManager {
         var stop = false
         var lastUiMs = 0L
 
-        val concurrency = settings.batchSize.coerceIn(8, 32)
-        val connectMs = settings.connectTimeoutMs.coerceIn(400, 2000)
+        val concurrency = settings.batchSize.coerceIn(4, 12)
+        val connectMs = settings.connectTimeoutMs.coerceIn(400, 1500)
         val stopAt = settings.stopWhenFound
         val semaphore = Semaphore(concurrency)
 
-        val jobs = configs.map { configUrl ->
-            async {
-                if (stop) {
-                    mutex.withLock { processed++ }
-                    return@async
-                }
-
-                semaphore.withPermit {
+        // Батчами, не 100 async сразу — меньше давление на GC/FD
+        val chunkSize = 24
+        for (chunk in configs.chunked(chunkSize)) {
+            if (stop) break
+            val jobs = chunk.map { configUrl ->
+                async {
                     if (stop) {
                         mutex.withLock { processed++ }
-                        return@withPermit
+                        return@async
                     }
-
-                    val node = parseNode(configUrl)
-                    val item = if (node != null) {
-                        val ping = try {
-                            TcpPinger.ping(node.host, node.port, connectMs)
-                        } catch (_: Exception) {
-                            TcpPinger.Result(false, -1, "error")
+                    semaphore.withPermit {
+                        if (stop) {
+                            mutex.withLock { processed++ }
+                            return@withPermit
                         }
-                        if (
-                            ping.ok &&
-                            ping.rttMs in 1 until settings.maxPingMs.coerceAtLeast(3000)
-                        ) {
-                            ConfigWithPing(
-                                url = configUrl,
-                                pingMs = ping.rttMs,
-                                profileLabel = profileLabel,
-                                protocol = node.protocol.uppercase(),
-                                remark = node.remark,
-                                host = node.host,
-                                port = node.port,
-                                status = ConfigStatus.AVAILABLE,
-                                statusText = "Доступен"
-                            )
+
+                        val node = parseNode(configUrl)
+                        val item = if (node != null) {
+                            val ping = try {
+                                TcpPinger.ping(node.host, node.port, connectMs)
+                            } catch (_: Exception) {
+                                TcpPinger.Result(false, -1, "error")
+                            }
+                            if (
+                                ping.ok &&
+                                ping.rttMs in 1 until settings.maxPingMs.coerceAtLeast(2500)
+                            ) {
+                                ConfigWithPing(
+                                    url = configUrl,
+                                    pingMs = ping.rttMs,
+                                    profileLabel = profileLabel,
+                                    protocol = node.protocol.uppercase(),
+                                    remark = node.remark.take(80),
+                                    host = node.host,
+                                    port = node.port,
+                                    status = ConfigStatus.AVAILABLE,
+                                    statusText = "Доступен"
+                                )
+                            } else null
                         } else null
-                    } else null
 
-                    val snapshot = mutex.withLock {
-                        processed++
-                        if (item != null) {
-                            results.add(item)
-                            working++
-                            if (stopAt > 0 && working >= stopAt) stop = true
+                        val snapshot = mutex.withLock {
+                            processed++
+                            if (item != null) {
+                                results.add(item)
+                                working++
+                                if (stopAt > 0 && working >= stopAt) stop = true
+                            }
+                            val now = System.currentTimeMillis()
+                            val pushUi = now - lastUiMs >= 200 || processed >= total || item != null
+                            if (pushUi) lastUiMs = now
+                            Quad(processed, working, item, pushUi)
                         }
-                        // UI не чаще 8 раз/сек — иначе Main Thread захлёбывается
-                        val now = System.currentTimeMillis()
-                        val pushUi = now - lastUiMs >= 120 || processed >= total || item != null
-                        if (pushUi) lastUiMs = now
-                        Quad(processed, working, item, pushUi)
-                    }
-                    if (snapshot.pushUi) {
-                        withContext(Dispatchers.Main) {
-                            onProgress(snapshot.p, total, snapshot.w)
-                            if (snapshot.found != null) onFound(snapshot.found)
+                        if (snapshot.pushUi) {
+                            withContext(Dispatchers.Main.immediate) {
+                                onProgress(snapshot.p, total, snapshot.w)
+                                if (snapshot.found != null) onFound(snapshot.found)
+                            }
                         }
                     }
                 }
             }
+            jobs.awaitAll()
         }
-
-        jobs.awaitAll()
-        // финальный progress
-        withContext(Dispatchers.Main) {
+        withContext(Dispatchers.Main.immediate) {
             onProgress(total, total, results.size)
         }
         results.sortedBy { it.pingMs }

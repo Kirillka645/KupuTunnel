@@ -7,10 +7,17 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -18,23 +25,39 @@ import com.kuputunnel.app.MainActivity
 import com.kuputunnel.app.R
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Стабильный VPN-сервис.
- * - FGS type для Android 14+
- * - Не стопается при null-intent restart
- * - Нет «health restart» thrashing
- * - WakeLock на время старта
+ * Системный VPN (Happ/Hiddify-style) через Xray + TUN fd.
+ *
+ * Ключевые стабилизаторы:
+ * - FGS specialUse (API 34+)
+ * - stats/policy в JSON (см. XrayConfigBuilder)
+ * - addDisallowedApplication — anti-loop без protect-callback
+ * - только IPv4 (меньше сюрпризов)
+ * - wake lock на всю сессию
+ * - мягкий health-check (1 рестарт, без thrashing)
+ * - не закрываем TUN fd пока core жив
  */
 class KupuVpnService : VpnService() {
 
     private var tun: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
     private var wakeLock: PowerManager.WakeLock? = null
+    private var currentLink: String? = null
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "kupu-vpn").apply { isDaemon = true }
     }
+    private val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "kupu-vpn-health").apply { isDaemon = true }
+    }
+    private var healthFuture: ScheduledFuture<*>? = null
+    private val restartBudget = AtomicInteger(1)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -56,7 +79,7 @@ class KupuVpnService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> {
                 worker.execute {
-                    stopVpnInternal()
+                    stopVpnInternal(clearPersist = false)
                     stopSelf()
                 }
                 return START_NOT_STICKY
@@ -68,17 +91,23 @@ class KupuVpnService : VpnService() {
                     ?: VpnSession.activeConfig
 
                 if (link.isNullOrBlank()) {
-                    if (running.get()) return START_STICKY
+                    if (running.get() && XrayEngine.isRunning()) return START_STICKY
                     log("no config, stop")
                     stopSelf()
                     return START_NOT_STICKY
                 }
 
-                if (running.get() && VpnSession.activeConfig == link) {
-                    updateNotification("VPN · ${VpnSession.activeProtocol} · ${VpnSession.activeRemark}")
+                if (running.get() &&
+                    XrayEngine.isRunning() &&
+                    VpnSession.activeConfig == link
+                ) {
+                    updateNotification(
+                        "VPN · ${VpnSession.activeProtocol} · ${VpnSession.activeRemark}"
+                    )
                     return START_STICKY
                 }
 
+                restartBudget.set(1)
                 worker.execute { startVpnInternal(link) }
             }
         }
@@ -88,17 +117,18 @@ class KupuVpnService : VpnService() {
     override fun onRevoke() {
         log("onRevoke")
         worker.execute {
-            stopVpnInternal()
+            stopVpnInternal(clearPersist = false)
             stopSelf()
         }
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        // Не гасим core синхронно — только флаги; worker сделает cleanup
         try {
+            cancelHealth()
+            unbindNetwork()
             running.set(false)
-            wakeLock?.let { if (it.isHeld) it.release() }
+            releaseWake()
         } catch (_: Exception) {
         }
         super.onDestroy()
@@ -107,9 +137,10 @@ class KupuVpnService : VpnService() {
     private fun startVpnInternal(shareLink: String) {
         acquireWake()
         try {
-            if (running.get()) {
-                // уже на другом узле — мягкий restart
+            // Сброс предыдущей сессии
+            if (running.get() || XrayEngine.isRunning() || tun != null) {
                 try {
+                    cancelHealth()
                     XrayEngine.stop()
                 } catch (_: Exception) {
                 }
@@ -119,7 +150,7 @@ class KupuVpnService : VpnService() {
                 }
                 tun = null
                 running.set(false)
-                Thread.sleep(300)
+                Thread.sleep(350)
             }
 
             if (prepare(this) != null) {
@@ -130,6 +161,8 @@ class KupuVpnService : VpnService() {
                 return
             }
 
+            bindUnderlyingNetwork()
+
             val builder = Builder()
                 .setSession("KupuTunnel")
                 .setMtu(1500)
@@ -137,14 +170,34 @@ class KupuVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
+                .setBlocking(true)
+
+            // Только IPv4 — IPv6 без маршрута ломает часть ROM
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    builder.allowFamily(OsConstants.AF_INET)
+                }
+            } catch (_: Exception) {
+            }
 
             try {
                 builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                log("disallow self fail: ${e.message}")
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
+            }
+
+            // underlying network → VPN не «зацикливается» на себе
+            try {
+                val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                val active = cm.activeNetwork
+                if (active != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    builder.setUnderlyingNetworks(arrayOf(active))
+                }
+            } catch (_: Exception) {
             }
 
             val pfd = builder.establish()
@@ -155,31 +208,30 @@ class KupuVpnService : VpnService() {
                 stopSelf()
                 return
             }
+            // Держим PFD живым пока VPN работает (не detachFd)
             tun = pfd
-            log("TUN fd=${pfd.fd}")
+            val fd = pfd.fd
+            log("TUN fd=$fd")
 
-            // TUN mode
-            var result = XrayEngine.start(this, shareLink, pfd.fd, useTun = true)
-            if (result.isFailure) {
-                log("tun start fail: ${result.exceptionOrNull()?.message}")
-                // retry once without tun inbound, fd still open for system
-                result = XrayEngine.start(this, shareLink, 0, useTun = false)
-            }
+            // Только TUN-режим. Без TUN = чёрная дыра (весь трафик в пустой interface).
+            val result = XrayEngine.start(this, shareLink, fd, useTun = true)
 
             if (result.isFailure) {
-                log("xray fail: ${result.exceptionOrNull()?.message}")
+                val err = result.exceptionOrNull()
+                log("xray fail: ${err?.message}")
                 try {
                     pfd.close()
                 } catch (_: Exception) {
                 }
                 tun = null
-                broadcast(STATE_FAILED, shortErr(result.exceptionOrNull()))
+                broadcast(STATE_FAILED, shortErr(err))
                 stopForegroundSafe()
                 stopSelf()
                 return
             }
 
             val built = result.getOrThrow()
+            currentLink = shareLink
             running.set(true)
             VpnSession.pendingConfig = shareLink
             VpnSession.activeConfig = shareLink
@@ -189,18 +241,53 @@ class KupuVpnService : VpnService() {
             updateNotification("VPN · ${built.protocol} · ${VpnSession.activeRemark}")
             broadcast(STATE_CONNECTED, VpnSession.activeRemark)
             log("UP ${built.protocol} ${built.host}:${built.port}")
+            scheduleHealth()
         } catch (e: Exception) {
             log("startVpn error: ${e.message}")
-            stopVpnInternal()
+            stopVpnInternal(clearPersist = false)
             broadcast(STATE_FAILED, e.message ?: "error")
             stopSelf()
-        } finally {
-            releaseWake()
         }
     }
 
-    private fun stopVpnInternal() {
+    private fun scheduleHealth() {
+        cancelHealth()
+        healthFuture = scheduler.scheduleWithFixedDelay({
+            try {
+                if (!running.get()) return@scheduleWithFixedDelay
+                if (XrayEngine.isRunning()) return@scheduleWithFixedDelay
+
+                log("health: core dead")
+                val link = currentLink ?: VpnSession.activeConfig
+                if (link != null && restartBudget.getAndDecrement() > 0) {
+                    log("health: one soft restart")
+                    worker.execute { startVpnInternal(link) }
+                } else {
+                    log("health: giving up")
+                    worker.execute {
+                        stopVpnInternal(clearPersist = false)
+                        broadcast(STATE_FAILED, "Xray остановился")
+                        stopSelf()
+                    }
+                }
+            } catch (e: Exception) {
+                log("health err: ${e.message}")
+            }
+        }, 4, 6, TimeUnit.SECONDS)
+    }
+
+    private fun cancelHealth() {
+        try {
+            healthFuture?.cancel(false)
+        } catch (_: Exception) {
+        }
+        healthFuture = null
+    }
+
+    private fun stopVpnInternal(clearPersist: Boolean) {
+        cancelHealth()
         running.set(false)
+        currentLink = null
         try {
             XrayEngine.stop()
         } catch (_: Exception) {
@@ -211,17 +298,61 @@ class KupuVpnService : VpnService() {
         }
         tun = null
         VpnSession.clearActive()
+        if (clearPersist) {
+            VpnSession.clearPersisted(this)
+        }
+        unbindNetwork()
+        releaseWake()
         broadcast(STATE_DISCONNECTED, "")
         stopForegroundSafe()
         log("DOWN")
     }
 
+    private fun bindUnderlyingNetwork() {
+        try {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            unbindNetwork()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val req = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build()
+                val cb = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                // не process-default (ломает VPN), только для reference
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                networkCallback = cb
+                cm.registerNetworkCallback(req, cb)
+            }
+        } catch (e: Exception) {
+            log("bind net: ${e.message}")
+        }
+    }
+
+    private fun unbindNetwork() {
+        try {
+            val cb = networkCallback ?: return
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        networkCallback = null
+    }
+
     private fun acquireWake() {
         try {
+            if (wakeLock?.isHeld == true) return
             val pm = getSystemService(POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kuputunnel:vpn").apply {
                 setReferenceCounted(false)
-                acquire(60_000L)
+                // держим всю сессию (max 3 часа, потом health/перезапуск)
+                acquire(3 * 60 * 60 * 1000L)
             }
         } catch (_: Exception) {
         }
@@ -283,6 +414,7 @@ class KupuVpnService : VpnService() {
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
@@ -317,14 +449,16 @@ class KupuVpnService : VpnService() {
     private fun log(msg: String) {
         Log.i(TAG, msg)
         try {
-            File(filesDir, "vpn.log").appendText("${System.currentTimeMillis()} $msg\n")
+            val f = File(filesDir, "vpn.log")
+            if (f.length() > 200_000) f.writeText("")
+            f.appendText("${System.currentTimeMillis()} $msg\n")
         } catch (_: Exception) {
         }
     }
 
     private fun shortErr(t: Throwable?): String {
         val m = t?.message ?: return "Xray error"
-        return m.take(120)
+        return m.take(140)
     }
 
     companion object {
@@ -399,5 +533,14 @@ object VpnSession {
             .getString(KEY_LINK, null)
     } catch (_: Exception) {
         null
+    }
+
+    fun clearPersisted(context: Context) {
+        try {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().remove(KEY_LINK).apply()
+        } catch (_: Exception) {
+        }
+        pendingConfig = null
     }
 }

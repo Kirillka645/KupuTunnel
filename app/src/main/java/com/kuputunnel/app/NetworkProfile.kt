@@ -27,24 +27,24 @@ data class ProfileSettings(
                 else -> mode
             }
             return when (effective) {
-                // Меньше параллелизма = нет ANR/фриза UI
+                // Лёгкий скан: меньше RAM/сокетов → нет kill process → нет «вылета на старт»
                 NetworkProfileMode.MOBILE -> ProfileSettings(
                     mode = effective,
                     label = "LTE / мобильный",
-                    batchSize = 12,
-                    connectTimeoutMs = 800,
-                    maxPingMs = 3500,
-                    maxToCheck = 80,
-                    stopWhenFound = 15
+                    batchSize = 8,
+                    connectTimeoutMs = 700,
+                    maxPingMs = 3000,
+                    maxToCheck = 50,
+                    stopWhenFound = 12
                 )
                 else -> ProfileSettings(
                     mode = NetworkProfileMode.WIFI,
                     label = "Wi‑Fi",
-                    batchSize = 16,
-                    connectTimeoutMs = 900,
-                    maxPingMs = 4000,
-                    maxToCheck = 100,
-                    stopWhenFound = 20
+                    batchSize = 10,
+                    connectTimeoutMs = 800,
+                    maxPingMs = 3500,
+                    maxToCheck = 60,
+                    stopWhenFound = 15
                 )
             }
         }

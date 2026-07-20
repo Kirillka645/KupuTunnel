@@ -11,7 +11,7 @@ import org.json.JSONObject
  */
 object ScanResultStore {
     private const val LAST_SCAN = "last_scan.json"
-    private const val MAX_ITEMS = 80
+    const val MAX_ITEMS = 60
 
     @Volatile
     var memory: List<ConfigWithPing> = emptyList()

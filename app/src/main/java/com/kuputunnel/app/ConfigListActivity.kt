@@ -44,23 +44,32 @@ class ConfigListActivity : AppCompatActivity() {
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
         toolbar.setNavigationOnClickListener { finish() }
 
-        // Всегда грузим с диска/памяти — безопасно
+        // Всегда с диска/памяти — НЕ из Intent extras (TransactionTooLarge)
         sourceName = intent.getStringExtra(MainActivity.EXTRA_SOURCE_NAME)
             ?: ScanResultStore.title
         supportActionBar?.title = sourceName
 
         configsList = try {
             ScanResultStore.load(this)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             emptyList()
         }
 
         // fallback: кэш Wi‑Fi/LTE
         if (configsList.isEmpty()) {
-            configsList = ConfigCache.loadWorking(this, NetworkProfileMode.WIFI)
-            if (configsList.isEmpty()) {
-                configsList = ConfigCache.loadWorking(this, NetworkProfileMode.MOBILE)
+            try {
+                configsList = ConfigCache.loadWorking(this, NetworkProfileMode.WIFI)
+                if (configsList.isEmpty()) {
+                    configsList = ConfigCache.loadWorking(this, NetworkProfileMode.MOBILE)
+                }
+            } catch (_: Exception) {
+                configsList = emptyList()
             }
+        }
+
+        // жёсткий cap — UI не взрывается
+        if (configsList.size > 80) {
+            configsList = configsList.take(80)
         }
 
         filteredList = configsList
@@ -70,6 +79,7 @@ class ConfigListActivity : AppCompatActivity() {
         recyclerView = findViewById(R.id.recyclerView)
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.setHasFixedSize(true)
+        recyclerView.setItemViewCacheSize(12)
         recyclerView.adapter = ConfigAdapter(this, filteredList)
 
         fabBest = findViewById(R.id.fabBest)

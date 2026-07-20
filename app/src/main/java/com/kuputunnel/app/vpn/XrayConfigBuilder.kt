@@ -9,9 +9,13 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
 /**
- * Share-link → Xray JSON.
- * БЕЗ geoip/geosite в routing — иначе core падает, если dat не подхватился,
- * и VPN «висит» 1 секунду.
+ * Share-link → Xray JSON для AndroidLibXrayLite.
+ *
+ * Важно:
+ * - stats + policy обязательны (иначе GetFeature(stats) → panic в lib)
+ * - protocol tun + env xray.tun.fd (ставит startLoop)
+ * - без geoip/geosite в routing
+ * - server IP/domain → direct (anti-loop)
  */
 object XrayConfigBuilder {
 
@@ -52,10 +56,34 @@ object XrayConfigBuilder {
         val root = JSONObject()
         root.put("log", JSONObject().put("loglevel", "warning"))
 
+        // Обязательно для AndroidLibXrayLite — иначе panic на statsManager
+        root.put("stats", JSONObject())
+        root.put(
+            "policy",
+            JSONObject()
+                .put(
+                    "levels",
+                    JSONObject().put(
+                        "8",
+                        JSONObject()
+                            .put("connIdle", 300)
+                            .put("handshake", 8)
+                            .put("uplinkOnly", 2)
+                            .put("downlinkOnly", 5)
+                    )
+                )
+                .put(
+                    "system",
+                    JSONObject()
+                        .put("statsOutboundUplink", true)
+                        .put("statsOutboundDownlink", true)
+                )
+        )
+
         val inbounds = JSONArray()
         inbounds.put(
             JSONObject()
-                .put("tag", "socks")
+                .put("tag", "socks-in")
                 .put("port", socksPort)
                 .put("listen", "127.0.0.1")
                 .put("protocol", "socks")
@@ -70,27 +98,30 @@ object XrayConfigBuilder {
                     "sniffing",
                     JSONObject()
                         .put("enabled", true)
-                        .put("destOverride", JSONArray().put("http").put("tls"))
+                        .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                        .put("routeOnly", false)
                 )
         )
         if (useTun) {
-            // Точно как в шаблоне AndroidLibXrayLite / v2rayNG
+            // Android: fd приходит через env xray.tun.fd (ставит Libv2ray.startLoop)
             inbounds.put(
                 JSONObject()
-                    .put("tag", "tun")
+                    .put("tag", "tun-in")
+                    .put("port", 0)
                     .put("protocol", "tun")
                     .put(
                         "settings",
                         JSONObject()
                             .put("name", "xray0")
-                            .put("MTU", 1500)
+                            .put("mtu", 1500)
                             .put("userLevel", 8)
                     )
                     .put(
                         "sniffing",
                         JSONObject()
                             .put("enabled", true)
-                            .put("destOverride", JSONArray().put("http").put("tls"))
+                            .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                            .put("routeOnly", false)
                     )
             )
         }
@@ -102,7 +133,7 @@ object XrayConfigBuilder {
             JSONObject()
                 .put("tag", "direct")
                 .put("protocol", "freedom")
-                .put("settings", JSONObject())
+                .put("settings", JSONObject().put("domainStrategy", "UseIP"))
         )
         outbounds.put(
             JSONObject()
@@ -113,7 +144,8 @@ object XrayConfigBuilder {
         root.put("outbounds", outbounds)
 
         val rules = JSONArray()
-        // private ranges — без geoip.dat
+
+        // private → direct
         val priv = JSONArray()
         PRIVATE_CIDRS.forEach { priv.put(it) }
         rules.put(
@@ -122,7 +154,8 @@ object XrayConfigBuilder {
                 .put("ip", priv)
                 .put("outboundTag", "direct")
         )
-        // server IP → direct (anti loop)
+
+        // server IP → direct (anti routing-loop)
         if (serverIps.isNotEmpty()) {
             val sip = JSONArray()
             serverIps.forEach { sip.put(it) }
@@ -141,7 +174,8 @@ object XrayConfigBuilder {
                     .put("outboundTag", "direct")
             )
         }
-        // default
+
+        // default → proxy
         rules.put(
             JSONObject()
                 .put("type", "field")
@@ -155,12 +189,18 @@ object XrayConfigBuilder {
                 .put("rules", rules)
         )
 
-        // Простой DNS без geosite
         root.put(
             "dns",
             JSONObject()
-                .put("servers", JSONArray().put("1.1.1.1").put("8.8.8.8"))
+                .put(
+                    "servers",
+                    JSONArray()
+                        .put("1.1.1.1")
+                        .put("8.8.8.8")
+                        .put("localhost")
+                )
                 .put("queryStrategy", "UseIPv4")
+                .put("disableCache", false)
         )
 
         return Built(
@@ -178,9 +218,9 @@ object XrayConfigBuilder {
         return try {
             InetAddress.getAllByName(host)
                 .mapNotNull { it.hostAddress }
-                .filter { !it.contains(":") } // только IPv4
+                .filter { !it.contains(":") }
                 .distinct()
-                .take(4)
+                .take(6)
         } catch (_: Exception) {
             emptyList()
         }
@@ -216,7 +256,6 @@ object XrayConfigBuilder {
             user.put("flow", flow)
         }
 
-        // vision только с tcp/raw
         val net = if (!flow.isNullOrBlank() && flow.contains("vision")) "tcp" else network
 
         val outbound = JSONObject()
@@ -257,13 +296,16 @@ object XrayConfigBuilder {
         val tls = o.optString("tls")
         val q = mapOf(
             "type" to network,
-            "security" to if (tls.equals("tls", true)) "tls" else "none",
+            "security" to if (tls.equals("tls", true) || tls.equals("reality", true)) tls.lowercase() else "none",
             "path" to o.optString("path").ifBlank { "/" },
             "host" to o.optString("host"),
             "sni" to o.optString("sni").ifBlank { o.optString("host") },
             "alpn" to o.optString("alpn"),
             "fp" to o.optString("fp"),
-            "headerType" to o.optString("type")
+            "headerType" to o.optString("type"),
+            "pbk" to o.optString("pbk"),
+            "sid" to o.optString("sid"),
+            "spx" to o.optString("spx")
         )
         val user = JSONObject()
             .put("id", uuid)
@@ -431,6 +473,11 @@ object XrayConfigBuilder {
                     .put("serverName", q["sni"] ?: q["host"] ?: "")
                     .put("allowInsecure", q["allowInsecure"] == "1" || q["insecure"] == "1")
                 q["fp"]?.takeIf { it.isNotBlank() }?.let { tls.put("fingerprint", it) }
+                q["alpn"]?.takeIf { it.isNotBlank() }?.let {
+                    val arr = JSONArray()
+                    it.split(",").forEach { p -> arr.put(p.trim()) }
+                    tls.put("alpn", arr)
+                }
                 stream.put("tlsSettings", tls)
             }
             "reality" -> {
@@ -446,6 +493,14 @@ object XrayConfigBuilder {
                 )
             }
         }
+
+        // sockopt: не привязываем mark — используем addDisallowedApplication
+        stream.put(
+            "sockopt",
+            JSONObject()
+                .put("tcpKeepAliveInterval", 30)
+                .put("tcpNoDelay", true)
+        )
         return stream
     }
 
