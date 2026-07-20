@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KupuTunnel</string>
+    <string name="tagline">Free VPN nodes · VLESS / Reality · one-tap best</string>
+    <string name="help">Справка</string>
+    <string name="theme">Тема</string>
+    <string name="cancel">Отмена</string>
+    <string name="copy">Копировать</string>
+    <string name="connect">Подключить</string>
+    <string name="copy_top10">Топ-10</string>
+    <string name="copy_all">Скопировать все</string>
+    <string name="about">О приложении</string>
+    <string name="loading_title">Загрузка конфигов</string>
+    <string name="checking_title">Проверка узлов</string>
+    <string name="preparing">Подготовка…</string>
+    <string name="ping_format">%1$d ms</string>
+    <string name="config_copied">Конфиг скопирован</string>
+    <string name="client_missing">Установите v2rayNG, Hiddify или NekoBox</string>
+    <string name="no_configs">Нет конфигов</string>
+    <string name="help_message">KupuTunnel собирает бесплатные VPN-конфиги (VLESS, Trojan, Hysteria2, VMess, Shadowsocks) из открытых парсеров, проверяет TCP-доступность (пинг) и сортирует по скорости.\n\n• Мега-скан — все источники сразу\n• «Лучший» — самый быстрый живой узел\n• Подключить — откроет v2rayNG / Hiddify / NekoBox\n• Можно тапнуть любой узел вручную\n\nИсточники: vansFenix, vpn-configs-for-russia, MatinGhanbari, ebrasha, TGParse, Free-v2ray-Configs.\n\nПолный VPN-туннель — в клиенте (v2rayNG и др.). KupuTunnel — радар лучших нод.</string>
+    <string name="disclaimer">Публичные бесплатные ноды нестабильны и могут быть небезопасны. Не используйте для чувствительных данных. На свой страх и риск.</string>
+</resources>
